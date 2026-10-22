@@ -122,7 +122,7 @@ PRoot 的 `CapEff=0` 是内核 capability 不透传导致的**硬限制**，不�
 
 ## 六、dsmod 有而我们没有的（诚实清单）
 
-**1. 环境完备性 —— 这是最大差距**
+**1. 环境完备性** —— ✅ **已对齐（按需切换）**
 
 `dsmod-full-stack` 用 `setup-all.sh` 幂等装 **305 个 Alpine 包**：
 
@@ -132,23 +132,27 @@ PRoot 的 `CapEff=0` 是内核 capability 不透传导致的**硬限制**，不�
   uber-apk-signer、apkid 3.2
 - 数据库：SQLite / PostgreSQL client / MariaDB client / Redis / Nginx
 
-我们只有 `python:3.12-slim` 一个镜像。策略不同：**用镜像切换替代全量预装**
-（`DS_IMAGE=python:3.12-bookworm` 换带 gcc 的），代价是每次切镜像要重新拉。
+现已提供 `docker/Dockerfile.full`，按 `setup-all.sh` 的五段结构完全重建，
+覆盖同样的 20+ 语言运行时与逆向工具链，并沿用它的两条经验
+（`/usr/local/bin` 下 sh wrapper、`verify-full` 逐项自检）。
 
-**2. MCP 的 HTTP 传输通道**
+差异在策略：默认镜像仍是 `python:3.12-slim`，全量镜像用 `DS_IMAGE` 按需切换
+——对齐能力但不让日常任务背 6-8GB 镜像。
+
+**2. MCP 的 HTTP 传输通道** —— ✅ **已补齐**
 
 原项目 `Mcp.smali` 2370 行，**HTTP 和 stdio 双通道**：
 `httpRequest`(L614) / `httpPost`(L425) / `stdioRequest`(L2007)。
-我们只有 stdio（`mcp_client.py` 166 行，纯标准库）。
 
-影响：接**远端** MCP 服务（SSE / HTTP 端点）目前做不到，只能接本地进程。
-stdio 是本地 server 的主流，但这确实是个能力缺口。
+我们现已对齐：`mcp_http.py` 实现 Streamable HTTP（2025-03-26）与
+HTTP+SSE（2024-11-05），可自动探测降级，接远端服务不再受限。
+（历史说明：此前只有 stdio，确实接不了远端。）
 
-**3. 流式 delta 处理**
+**3. 流式 delta 处理** —— ✅ **已补齐**
 
-`IDLE_MS = 1500` 是"流式输出空闲多久判定代码块已闭合"的 debounce，
-配合手写状态机处理**边生成边解析**。我们走 API 的结构化 `tool_calls`，
-不需要这个——但代价是**无法做流式实时显示**（必须等整条响应返回）。
+`IDLE_MS = 1500` 那套现已移植到 `streaming.py`：`FenceScanner` 状态机
+（切成 7 字节碎片仍能正确切围栏）、`IdleGate` 空闲判定、`StreamRenderer` 实时渲染。
+不同点：**优先用结构化 tool_calls，围栏只作兜底**，且兜底只自动执行 `bash/sh` 围栏。
 
 **4. 反射注入技术**
 
@@ -156,10 +160,13 @@ stdio 是本地 server 的主流，但这确实是个能力缺口。
 `injectPrompt`(L2710) 在发送前插提示词，改造层与宿主**无编译期依赖**。
 这套"插件化改造第三方 App"的手法通用价值很高，但我们需要它——我们就是宿主。
 
-**5. skill 围栏类型**
+**5. skill 围栏类型** —— ✅ **已补齐**
 
-原项目支持三种围栏：`bash/sh`、`mcp`、`skill`。我们只有工具调用，
-没有独立的 skill 抽象（能力被并进了工具集）。
+`skills.py` 实现 skill 抽象层：带 trigger 的方法学模板，命中才注入，
+最多 2 个避免提示词膨胀。内置 `tdd` / `debug` / `review` 三个。
+
+形态差异：dsmod 的 skill 是**运行时围栏**（模型输出 ```skill``` 触发），
+我们是**编译期注入**（命中后并入系统提示）。后者更省 token，但少了动态性。
 
 ---
 
