@@ -286,6 +286,18 @@ python3 ds_agent_pro.py "统计下载目录里所有 csv 的行数，写个脚�
 python3 selftest.py
 ```
 
+## 与 dsmod-* 的关系
+
+本项目受 `liuben3223380369-ops/dsmod-*` 启发并做了针对性重写。
+两者性质不同：dsmod 是**逆向研究资料**（smali 逐字节分析 + 环境增强脚本），
+ds-agent 是**可直接部署运行的产品**。
+
+- `COMPARE.md` —— 终端实现的逐项对比（execOnce vs 持久会话）与实测数据
+- `PROJECT_COMPARE.md` —— 项目级对比：定位差异、核心链路、双方能力缺口
+
+核心差异一句话：dsmod 要手写 219 行状态机解析 ```bash``` 围栏（因为模型不支持
+function calling），ds-agent 用原生 tool_calls，**解析代码为 0 行**。
+
 ## 文件
 
 | 文件 | 作用 |
@@ -297,6 +309,7 @@ python3 selftest.py
 | `arch_cards.py` | 架构知识按需注入（工程坑位取向，非架构科普） |
 | `selftest.py` | 本地自检（与 CI 同断言，push 前跑一遍） |
 | `COMPARE.md` | 与 dsmod 终端实现的逐项对比与实测数据 |
+| `PROJECT_COMPARE.md` | 项目级对比：定位差异、核心链路、能力缺口 |
 | `mcp_fs_server.py` | 文件系统 MCP Server（白名单授权，读写可切） |
 | `mcp_client.py` | MCP stdio 客户端（JSON-RPC 2.0，纯标准库） |
 | `mcp_demo_server.py` | 示例 MCP Server，也是写新 Server 的模板 |
