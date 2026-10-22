@@ -46,7 +46,7 @@ docker pull python:3.12-slim
 
 没有 Docker 也能跑，会**自动回退本地执行**并在启动时警告。本地模式 = 你的真实环境，跑不信任代码等于裸奔。
 
-## 七项能力
+## 十项能力
 
 ### 0. 主动介入（卡住就停下来问人）
 
@@ -79,7 +79,69 @@ docker pull python:3.12-slim
 `continue`（默认）/ `rollback` / `hint` / `abort`。
 整个机制可用 `DS_INTERVENE=0` 关闭。
 
-### 1. 调试链优化（不再原地打转）
+### 1. MCP HTTP 通道（补齐远端能力）
+
+此前只有 stdio，接不了远端服务。现支持两种 HTTP 传输（纯标准库）：
+
+| 传输 | 协议版本 | 用法 |
+|---|---|---|
+| Streamable HTTP | 2025-03-26 | `{"url": "...", "type": "streamable-http"}` |
+| HTTP + SSE | 2024-11-05 | `{"url": "...", "type": "sse"}` |
+| 自动探测 | — | 只给 `url`，先试 streamable，失败降级 SSE |
+
+对应 dsmod 的 `Mcp.smali`（它 2370 行实现了双通道）。header 支持
+`${ENV_VAR}` 展开，密钥不用写进配置。
+
+要点：SSE 响应没有 Content-Length，直接 `read()` 会等到超时——
+实现里改成增量读，拿到第一个完整事件就收工。
+
+### 2. 环境工具链：完全对齐 305 包
+
+`docker/Dockerfile.full` 按 dsmod-full-stack 的 `setup-all.sh` 五段结构重建：
+
+```bash
+docker build -f docker/Dockerfile.full -t ds-agent-full:3.20 .
+docker run --rm ds-agent-full:3.20 verify-full     # 逐项自检
+DS_IMAGE=ds-agent-full:3.20 python3 ds_agent_pro.py "..."
+```
+
+覆盖 20+ 语言运行时（Python/Node/Go/Rust/Java/Kotlin/Scala/Groovy/Clojure/
+PHP/Ruby/Perl/Lua/Elixir/Erlang/R/.NET/GHC）+ jadx/apktool/aapt2/r8/d8/
+uber-apk-signer/apkid + SQLite/PgSQL/MariaDB/Redis/Nginx。
+
+沿用它两条经验：**工具做成 `/usr/local/bin` 下的 sh wrapper**（`env -i` 也能找到，
+不依赖 profile），以及 **verify.sh 逐项自检**。镜像源默认 tuna + ghfast。
+
+日常仍用 `python:3.12-slim`（默认），全量镜像按需切——对齐能力但不拖慢日常任务。
+
+### 3. 流式实时输出 + 围栏兜底
+
+对齐 dsmod 的 `IDLE_MS = 1500` 那套：
+
+- `FenceScanner`：状态机而非正则。流式到达时文本可能停在围栏中间，
+  正则匹配不上——这正是它写 219 行的原因。实测把输入切成 7 字节碎片仍能正确切出。
+- `ToolCallAccumulator`：结构化 tool_calls 的参数会被切成碎片（可能从字符串中间断开），
+  累积到流结束再整体解析。
+- `StreamRenderer`：边生成边显示，思考过程单独用暗色前缀。
+
+**优先用结构化 tool_calls，没有时才用围栏兜底**——且兜底只自动执行
+`bash/sh` 围栏，其他语言围栏只展示不执行。
+
+开关：`DS_STREAM=0` 关闭，`DS_STREAM_REASON=0` 隐藏思考过程，`DS_IDLE_MS` 调阈值。
+
+### 4. Skill 抽象层
+
+对齐 dsmod 的第三种围栏类型（bash/sh、mcp、**skill**）。
+
+Skill = 带 trigger 的提示词模板，命中才注入，最多 2 个避免提示词膨胀。
+内置三个：`tdd`（测试驱动）、`debug`（系统化调试）、`review`（交付前自查）。
+
+```bash
+ls skills/          # 可直接编辑，改完生效
+DS_SKILL_MAX=3 ...  # 调最多注入几个
+```
+
+### 5. 调试链优化（不再原地打转）
 
 朴素循环最大的浪费：模型用同一种修法反复试同一个错，20 轮全在打补丁。
 
@@ -99,7 +161,7 @@ docker pull python:3.12-slim
 
 另有：成功信号自动重置停滞计数；写了实现却无断言时提示补最小验证。
 
-### 2. 架构知识按需注入
+### 6. 架构知识按需注入
 
 **结论先说：绝大多数任务用不上，常驻反而诱发过度设计。** 所以做成条件注入——
 只有任务确实涉及模型/训练才加载，且注入的是**工程坑位**而非架构科普。
@@ -114,7 +176,7 @@ is_arch_task("实现 mamba 混合架构")  # True  → 追加 2026 前沿卡
 mHC 的 Sinkhorn 约束为何能防数值爆炸、Muon+AdamW 分工、MoE 的 expert collapse、
 MLA 压缩。**每条都标注了坑在哪，以及"什么时候不该用"。**
 
-### 3. 持久终端会话（对照 dsmod 优化）
+### 7. 持久终端会话（对照 dsmod 优化）
 
 `terminal.py` 是对 GitHub 项目 `dsmod-*` 终端部分的针对性重写。核心差异：
 
@@ -133,7 +195,7 @@ MLA 压缩。**每条都标注了坑在哪，以及"什么时候不该用"。**
 模型侧获得的能力：可以 `cd` 后连续执行、`export` 后续有效、每次返回带 `[cwd]`；
 另有 `shell_reset` 工具重置被污染的状态。
 
-### 4. Docker 沙箱
+### 8. Docker 沙箱
 
 容器参数：`--network=none --memory=512m --cpus=1 --pids-limit=128`，工作目录只读挂载为 `/w`。
 
@@ -143,7 +205,7 @@ MLA 压缩。**每条都标注了坑在哪，以及"什么时候不该用"。**
 
 另有两层兜底，容器内外都生效：命令黑名单（`rm -rf /`、`dd if=`、fork 炸弹等）、路径逃逸检查（拒绝 `../../etc/passwd`）、超时熔断。
 
-### 5. 文件系统外链（手机 / 外部文件夹）
+### 9. 文件系统外链（手机 / 外部文件夹）
 
 用 `DS_FS_ROOTS` 授权真实目录给模型，多路径用 `:` 分隔：
 
@@ -161,7 +223,7 @@ DS_FS_READONLY=1 DS_FS_ROOTS="/sdcard/DCIM" python3 ds_agent_pro.py "..."
 
 Docker 模式下外部目录会同步挂进容器（`/ext/0`、`/ext/1`…），代码里可用绝对路径访问；只读模式一律 `:ro` 挂载。
 
-### 6. MCP 支持
+### 10. MCP 支持
 
 `mcp.json` 用 Claude Desktop 同款格式：
 
@@ -186,7 +248,7 @@ python3 ds_agent_pro.py --mcp-only
 
 `mcp_demo_server.py` 是纯标准库的 Server 模板，加工具只需往 `TOOLS` 和 `HANDLERS` 里各加一项。
 
-### 7. Git 快照回滚
+### 11. Git 快照回滚
 
 每步改动自动 commit。跑崩了三种回法：
 
@@ -226,6 +288,11 @@ python3 ds_agent_pro.py --rollback 3     # 回退 3 步
 | `DS_ITER_TIME` | `240` | 已用多久且仍在失败时介入（秒） |
 | `DS_ON_STUCK` | `continue` | 非交互环境策略：`continue`/`rollback`/`hint`/`abort` |
 | `DS_HINT` | 空 | `DS_ON_STUCK=hint` 时的提示内容 |
+| `DS_STREAM` | `1` | 设 `0` 关闭流式输出 |
+| `DS_STREAM_REASON` | `1` | 设 `0` 隐藏思考过程 |
+| `DS_IDLE_MS` | `1500` | 空闲判定阈值（对齐 dsmod 的 `IDLE_MS`） |
+| `DS_SKILL_DIR` | `./skills` | skill 目录 |
+| `DS_SKILL_MAX` | `2` | 最多注入几个 skill |
 
 ## 手机（Termux）专用说明
 
@@ -277,7 +344,7 @@ python3 ds_agent_pro.py "统计下载目录里所有 csv 的行数，写个脚�
 
 ## 持续集成
 
-`.github/workflows/ci.yml` 在每次 push / PR 时跑 9 组断言（语法、MCP 协议、
+`.github/workflows/ci.yml` 在每次 push / PR 时跑 12 组断言（语法、MCP 协议、
 终端状态与超时、60 次压测、调试顾问、架构卡片、主动介入、安全隔离、setup.sh）。
 
 本地先自检再 push，断言与 CI 完全一致：
@@ -311,6 +378,10 @@ function calling），ds-agent 用原生 tool_calls，**解析代码为 0 行**�
 | `COMPARE.md` | 与 dsmod 终端实现的逐项对比与实测数据 |
 | `PROJECT_COMPARE.md` | 项目级对比：定位差异、核心链路、能力缺口 |
 | `mcp_fs_server.py` | 文件系统 MCP Server（白名单授权，读写可切） |
-| `mcp_client.py` | MCP stdio 客户端（JSON-RPC 2.0，纯标准库） |
+| `mcp_client.py` | MCP 客户端与传输适配（stdio / HTTP 统一接口） |
+| `mcp_http.py` | MCP HTTP 传输：Streamable HTTP + HTTP/SSE |
+| `streaming.py` | 流式渲染、围栏状态机、工具调用碎片累积 |
+| `skills.py` | Skill 抽象层（对齐 dsmod 的第三种围栏） |
+| `docker/Dockerfile.full` | 全量工具链镜像（对齐 305 包） |
 | `mcp_demo_server.py` | 示例 MCP Server，也是写新 Server 的模板 |
 | `ds_agent.py` | 精简版（仅本地执行，无上面四项） |

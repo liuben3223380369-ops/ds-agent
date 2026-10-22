@@ -2,15 +2,28 @@
   "mcpServers": {
     "demo": {
       "command": "python3",
-      "args": ["mcp_demo_server.py"]
+      "args": [
+        "mcp_demo_server.py"
+      ]
     },
     "filesystem": {
       "command": "python3",
-      "args": ["mcp_fs_server.py"],
+      "args": [
+        "mcp_fs_server.py"
+      ],
       "env": {
         "MCP_FS_ROOTS": "/sdcard/Download:/sdcard/Documents",
         "MCP_FS_READONLY": "1"
       }
+    },
+    "remote-example": {
+      "_comment": "远端 MCP 服务示例（默认禁用）",
+      "url": "https://mcp.example.com/mcp",
+      "type": "streamable-http",
+      "headers": {
+        "Authorization": "Bearer ${MCP_TOKEN}"
+      },
+      "disabled": true
     }
   }
 }

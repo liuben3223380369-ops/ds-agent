@@ -9,6 +9,7 @@ push 之前先跑一遍，避免 CI 挂了才知道。
 
 import os
 import sys
+import json
 import time
 import shutil
 import tempfile
@@ -134,9 +135,9 @@ def t_arch():
 
 
 def t_safe():
-    d = tempfile.mkdtemp()
-    os.environ["DS_WORKDIR"] = d
     import ds_agent_pro as A
+    # 模块可能已被前面的用例导入（ROOT 在导入时固定），这里直接用它的 ROOT
+    os.makedirs(A.ROOT, exist_ok=True)
     try:
         A.safe_path("../../etc/passwd")
         raise AssertionError("路径逃逸未被拦截")
@@ -145,7 +146,114 @@ def t_safe():
     sb = A.Sandbox(A.ROOT, "local", [])
     assert "已拦截" in sb.run_shell("rm -rf / tmp"), "危险命令未被拦截"
     sb.close()
-    shutil.rmtree(d, ignore_errors=True)
+
+
+def t_mcp_http():
+    """两种 HTTP 传输 + 集成到 MCPHub（起本地测试服务端）。"""
+    import subprocess, signal, tempfile
+    from mcp_http import StreamableHTTPClient, SSEClient, build_http_client
+
+    port = 8931
+    srv = subprocess.Popen(
+        [sys.executable, "tests/mcp_http_test_server.py", str(port)],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(2.5)
+        assert srv.poll() is None, "测试服务端启动失败"
+        base = f"http://127.0.0.1:{port}"
+
+        # Streamable HTTP
+        c = StreamableHTTPClient(f"{base}/mcp", timeout=10)
+        info = c.request("initialize", {"protocolVersion": "2025-03-26",
+                                        "capabilities": {}, "clientInfo": {}})
+        assert info.get("serverInfo"), "initialize 未返回 serverInfo"
+        tools = c.request("tools/list")
+        assert len(tools["tools"]) == 2, "工具数不符"
+        r = c.request("tools/call", {"name": "remote_echo", "arguments": {"text": "hi"}})
+        assert "remote echo: hi" in r["content"][0]["text"], "调用结果不符"
+
+        # 旧式 SSE
+        s = SSEClient(f"{base}/sse", timeout=10, connect_timeout=8)
+        s.start()
+        assert s.endpoint, "未拿到 endpoint"
+        assert s.request("tools/list")["tools"], "SSE tools/list 为空"
+        r2 = s.request("tools/call", {"name": "remote_echo",
+                                      "arguments": {"text": "sse"}}, timeout=10)
+        assert "remote echo: sse" in r2["content"][0]["text"], "SSE 调用结果不符"
+        s.close()
+
+        # 经 MCPHub 集成（streamable）
+        import ds_agent_pro as A
+        cfgp = os.path.join(tempfile.mkdtemp(), "mcp.json")
+        with open(cfgp, "w") as f:
+            json.dump({"mcpServers": {"remote": {
+                "url": f"{base}/mcp", "type": "streamable-http"}}}, f)
+        hub = A.MCPHub(cfgp)
+        ts = hub.start()
+        assert ts, "MCPHub 未拉到远端工具"
+        assert "remote echo" in hub.call(ts[0]["function"]["name"], {"text": "hub"})
+        hub.close()
+    finally:
+        srv.send_signal(signal.SIGKILL)
+        try:
+            srv.wait(timeout=3)
+        except Exception:
+            pass
+
+
+def t_streaming():
+    """围栏状态机（流式切碎）+ 工具调用碎片累积。"""
+    from streaming import FenceScanner, ToolCallAccumulator, IdleGate
+
+    # 流被切成 7 字节的碎片，围栏仍要正确切出
+    sc = FenceScanner()
+    full = "前\n```bash\necho a\nls\n```\n中\n```python\nprint(1)\n```\n后\n"
+    got = []
+    for i in range(0, len(full), 7):
+        got += sc.feed(full[i:i + 7])
+    got += sc.flush()
+    assert len(got) == 2, f"应切出 2 块，实际 {len(got)}: {got}"
+    assert got[0][0] == "bash" and "ls" in got[0][1]
+    assert got[1][0] == "python"
+
+    # 未闭合不应产出
+    sc2 = FenceScanner()
+    assert sc2.feed("```bash\necho x\n") == [], "未闭合块不应产出"
+
+    # 工具调用参数碎片累积（后续分片 name 为 None，参数不能丢）
+    acc = ToolCallAccumulator()
+    acc.feed({"index": 0, "id": "c1", "name": "run_shell", "args": '{"cmd":"ech'})
+    acc.feed({"index": 0, "id": None, "name": None, "args": "o hi"})
+    acc.feed({"index": 0, "id": None, "name": None, "args": '"}'})
+    calls = acc.build()
+    assert len(calls) == 1 and calls[0].function.name == "run_shell", "名称未拼出"
+    assert json.loads(calls[0].function.arguments) == {"cmd": "echo hi"}, "参数未拼全"
+
+    g = IdleGate(idle_ms=50)
+    g.touch()
+    assert not g.is_idle(), "刚 touch 不应 idle"
+    time.sleep(0.08)
+    assert g.is_idle(), "超过 idle_ms 应判 idle"
+
+
+def t_skills():
+    from skills import SkillBook, ensure_builtin, parse_front_matter
+    import tempfile
+
+    meta, body = parse_front_matter(
+        "---\nname: tdd\ntrigger: 写代码|实现\ntags: [a, b]\n---\n正文")
+    assert meta["name"] == "tdd" and meta["trigger"] == "写代码|实现"
+    assert "a" in meta["tags"] and body.strip() == "正文"
+
+    d = tempfile.mkdtemp()
+    ensure_builtin(d)
+    bk = SkillBook(d)
+    assert set(["tdd", "debug", "review"]).issubset(set(bk.names())), "内置 skill 缺失"
+    assert [s.name for s in bk.select("帮我写个函数")] == ["tdd"]
+    assert [s.name for s in bk.select("这个报错怎么修")] == ["debug"]
+    assert bk.select("写个快排") == [], "无关任务不应命中"
+    assert "### skill:" in bk.render("帮我写代码")
 
 
 def t_intervene():
@@ -244,6 +352,9 @@ if __name__ == "__main__":
     check("终端可靠性压测 60 次", t_stress)
     check("调试顾问（分类/指纹/升级）", t_advisor)
     check("架构卡片（按需注入）", t_arch)
+    check("MCP HTTP 传输（streamable + SSE）", t_mcp_http)
+    check("流式（围栏状态机 + 调用碎片累积）", t_streaming)
+    check("Skill 抽象层（解析/命中/渲染）", t_skills)
     check("主动介入（触发/决策/注入）", t_intervene)
     check("路径与命令安全", t_safe)
     check("setup.sh 语法", t_setup)

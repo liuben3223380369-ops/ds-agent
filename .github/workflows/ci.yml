@@ -241,6 +241,109 @@ jobs:
           print("✅ 主动介入：触发/报告/决策/非交互/注入 全通过")
           EOF
 
+      - name: MCP HTTP transports (streamable + SSE)
+        run: |
+          python - <<'EOF'
+          import sys, os, json, time, tempfile, subprocess, signal
+          sys.path.insert(0, '.')
+          from mcp_http import StreamableHTTPClient, SSEClient
+
+          port = 8931
+          srv = subprocess.Popen([sys.executable, "tests/mcp_http_test_server.py", str(port)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          try:
+              time.sleep(2.5)
+              assert srv.poll() is None, "测试服务端启动失败"
+              base = f"http://127.0.0.1:{port}"
+
+              c = StreamableHTTPClient(f"{base}/mcp", timeout=10)
+              assert c.request("initialize", {"protocolVersion": "2025-03-26",
+                                              "capabilities": {}, "clientInfo": {}}).get("serverInfo")
+              assert len(c.request("tools/list")["tools"]) == 2
+              r = c.request("tools/call", {"name": "remote_echo", "arguments": {"text": "hi"}})
+              assert "remote echo: hi" in r["content"][0]["text"]
+
+              s = SSEClient(f"{base}/sse", timeout=10, connect_timeout=8)
+              s.start()
+              assert s.endpoint, "未拿到 endpoint"
+              r2 = s.request("tools/call", {"name": "remote_echo",
+                                            "arguments": {"text": "sse"}}, timeout=10)
+              assert "remote echo: sse" in r2["content"][0]["text"]
+              s.close()
+
+              import ds_agent_pro as A
+              cfgp = os.path.join(tempfile.mkdtemp(), "mcp.json")
+              json.dump({"mcpServers": {"remote": {"url": f"{base}/mcp",
+                                                   "type": "streamable-http"}}}, open(cfgp, "w"))
+              hub = A.MCPHub(cfgp)
+              ts = hub.start()
+              assert ts, "MCPHub 未拉到远端工具"
+              assert "remote echo" in hub.call(ts[0]["function"]["name"], {"text": "hub"})
+              hub.close()
+          finally:
+              srv.send_signal(signal.SIGKILL)
+              try:
+                  srv.wait(timeout=3)
+              except Exception:
+                  pass
+          print("✅ MCP HTTP：streamable + SSE + MCPHub 集成 通过")
+          EOF
+
+      - name: Streaming (fence state machine + tool call accumulation)
+        run: |
+          python - <<'EOF'
+          import sys, json, time
+          sys.path.insert(0, '.')
+          from streaming import FenceScanner, ToolCallAccumulator, IdleGate
+
+          sc = FenceScanner()
+          full = "前\n```bash\necho a\nls\n```\n中\n```python\nprint(1)\n```\n后\n"
+          got = []
+          for i in range(0, len(full), 7):
+              got += sc.feed(full[i:i + 7])
+          got += sc.flush()
+          assert len(got) == 2, f"应切出 2 块: {got}"
+          assert got[0][0] == "bash" and got[1][0] == "python"
+          assert FenceScanner().feed("```bash\necho x\n") == [], "未闭合不应产出"
+
+          acc = ToolCallAccumulator()
+          acc.feed({"index": 0, "id": "c1", "name": "run_shell", "args": '{"cmd":"ech'})
+          acc.feed({"index": 0, "id": None, "name": None, "args": "o hi"})
+          acc.feed({"index": 0, "id": None, "name": None, "args": '"}'})
+          calls = acc.build()
+          assert calls[0].function.name == "run_shell", "名称未拼出"
+          assert json.loads(calls[0].function.arguments) == {"cmd": "echo hi"}, "参数未拼全"
+
+          g = IdleGate(idle_ms=50)
+          g.touch()
+          assert not g.is_idle()
+          time.sleep(0.08)
+          assert g.is_idle(), "超过 idle_ms 应判 idle"
+          print("✅ 流式：围栏状态机 + 参数碎片累积 + 空闲判定 通过")
+          EOF
+
+      - name: Skills (parse, match, render)
+        run: |
+          python - <<'EOF'
+          import sys, tempfile
+          sys.path.insert(0, '.')
+          from skills import SkillBook, ensure_builtin, parse_front_matter
+
+          meta, body = parse_front_matter(
+              "---\nname: tdd\ntrigger: 写代码|实现\ntags: [a, b]\n---\n正文")
+          assert meta["name"] == "tdd" and meta["trigger"] == "写代码|实现"
+          assert "a" in meta["tags"] and body.strip() == "正文"
+
+          d = tempfile.mkdtemp()
+          ensure_builtin(d)
+          bk = SkillBook(d)
+          assert {"tdd", "debug", "review"}.issubset(set(bk.names())), "内置 skill 缺失"
+          assert [s.name for s in bk.select("帮我写个函数")] == ["tdd"]
+          assert bk.select("写个快排") == [], "无关任务不应命中"
+          assert "### skill:" in bk.render("帮我写代码")
+          print("✅ Skill：解析 / 命中 / 渲染 通过")
+          EOF
+
       - name: Path sandbox & shell safety
         run: |
           python - <<'EOF'

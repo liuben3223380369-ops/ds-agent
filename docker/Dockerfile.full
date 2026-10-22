@@ -1,0 +1,110 @@
+# syntax=docker/dockerfile:1
+#
+# ds-agent 全量工具链镜像 —— 对齐 dsmod-full-stack 的 305 包环境
+#
+# 构建（约 15-25 分钟，最终约 6-8 GB）：
+#   docker build -f docker/Dockerfile.full -t ds-agent-full:3.20 .
+#
+# 使用：
+#   DS_IMAGE=ds-agent-full:3.20 python3 ds_agent_pro.py "..."
+#
+# 与 dsmod 的差异：
+#   · 基础镜像是真 Alpine 3.20（dsmod 是 App 内 PRoot 跑的 alpine.tar.gz）
+#   · 镜像源默认 tuna，可用 --build-arg 切换
+#   · 逆向工具（jadx/apktool/r8）同样走下载，但落盘到 /opt 而非 APK assets
+#   · 额外装了 ds-agent 自身需要的 python3 + py3-virtualenv
+
+ARG ALPINE=3.20
+FROM alpine:${ALPINE}
+
+ARG TUNA=https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.20
+ARG GH=https://ghfast.top
+ARG PYPI=https://pypi.tuna.tsinghua.edu.cn/simple
+
+ENV LANG=C.UTF-8 \
+    PATH="/opt/jvm-langs/kotlinc/bin:/opt/jvm-langs/groovy/bin:/opt/jvm-langs/scala/bin:/opt/dt/bin:/opt/jadx/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin" \
+    JAVA_HOME=/usr/lib/jvm/java-17-openjdk \
+    GOPROXY=https://goproxy.cn,direct \
+    npm_config_registry=https://registry.npmmirror.com \
+    PIP_INDEX_URL=${PYPI}
+
+RUN echo "${TUNA}/main"      > /etc/apk/repositories && \
+    echo "${TUNA}/community" >> /etc/apk/repositories && \
+    echo "${TUNA}/testing"   >> /etc/apk/repositories
+
+# ================= 1/5 基础包 =================
+# 对应 setup-all.sh 第 1 段
+RUN apk add --no-cache \
+      ca-certificates bash bash-completion coreutils findutils \
+      grep sed gawk less file jq which htop tmux vim git openssl sqlite \
+      ripgrep fd ncurses-terminfo python3 py3-pip python3-dev py3-virtualenv \
+      build-base linux-headers libffi-dev openssl-dev curl wget unzip zip \
+      nodejs npm go
+
+# ================= 2/5 语言运行时 =================
+# 对应 setup-all.sh 第 2 段
+RUN apk add --no-cache \
+      clang clang-dev compiler-rt lld llvm llvm-dev \
+      rust cargo R R-dev \
+      php83 php83-cli php83-phar php83-openssl php83-mbstring php83-curl php83-json \
+      ruby ruby-dev ruby-bundler perl perl-dev lua5.4 luajit \
+      elixir erlang sqlite postgresql-client mariadb-client redis nginx \
+      dotnet8 ghc gradle maven \
+      openjdk17-jdk openjdk17-jre
+
+# ds-agent 自身依赖：只额外要一个 openai SDK
+# 装到系统 Python，容器里直接可用
+RUN python3 -m pip config set global.index-url ${PYPI} 2>/dev/null || true ; \
+    python3 -m pip install --break-system-packages --no-cache-dir openai
+
+# 命令 wrapper 辅助函数：把工具做成 /usr/local/bin 下的 sh 脚本，
+# 不依赖 PATH 是否加载 profile（学 dsmod 的落地方式）
+RUN printf '#!/bin/sh\nmk() { printf "%%s\\n" "$2" > "/usr/local/bin/$1"; chmod +x "/usr/local/bin/$1"; }\n' > /usr/local/bin/mkhelper
+
+# ================= 3/5 Python 侧工具 =================
+RUN python3 -m pip install --break-system-packages --no-cache-dir apkid || true
+
+# ================= 4/5 JVM 语言（手动下载） =================
+ENV JVM=/opt/jvm-langs
+RUN mkdir -p ${JVM} && cd ${JVM} && \
+    (curl -sSL --retry 3 -o k.zip ${GH}/https://github.com/JetBrains/kotlin/releases/download/v2.0.21/kotlin-compiler-2.0.21.zip && unzip -q -o k.zip && rm -f k.zip) || echo "[skip] kotlin" && \
+    (curl -sSL --retry 3 -o g.zip https://archive.apache.org/dist/groovy/4.0.22/distribution/apache-groovy-binary-4.0.22.zip && unzip -q -o g.zip && mv groovy-4.0.22 groovy && rm -f g.zip) || echo "[skip] groovy" && \
+    (curl -sSL --retry 3 -o s.tgz ${GH}/https://github.com/scala/scala3/releases/download/3.5.2/scala3-3.5.2.tar.gz && tar xzf s.tgz && mv scala3-3.5.2 scala && rm -f s.tgz) || echo "[skip] scala" && \
+    (curl -sSL --retry 3 -o /tmp/clj.sh ${GH}/https://github.com/clojure/brew-install/releases/download/1.11.4.1474/linux-install.sh && chmod +x /tmp/clj.sh && /tmp/clj.sh -p /usr/local) || echo "[skip] clojure"
+
+# ================= 5/5 逆向工具链 =================
+ENV JADX=/opt/jadx \
+    DT=/opt/dt
+RUN mkdir -p ${JADX} && cd ${JADX} && \
+    (curl -sSL --retry 3 -o j.zip ${GH}/https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip && unzip -q -o j.zip && rm -f j.zip) || echo "[skip] jadx" ; \
+    mkdir -p ${DT}/bin ${DT}/jar
+
+# wrapper：即使 env -i 也能找到（关键：不依赖 profile）
+RUN set -e ; \
+    [ -f ${JADX}/bin/jadx ] && printf '#!/bin/sh\nexec %s/bin/jadx "$@"\n' "${JADX}" > /usr/local/bin/jadx && chmod +x /usr/local/bin/jadx || echo "[skip] jadx wrapper" ; \
+    [ -f ${DT}/jar/apktool.jar ] && printf '#!/bin/sh\nexec java -jar %s/jar/apktool.jar "$@"\n' "${DT}" > /usr/local/bin/apktool && chmod +x /usr/local/bin/apktool || echo "[skip] apktool" ; \
+    [ -f ${DT}/jar/uber-apk-signer.jar ] && printf '#!/bin/sh\nexec java -jar %s/jar/uber-apk-signer.jar "$@"\n' "${DT}" > /usr/local/bin/uber-apk-signer && chmod +x /usr/local/bin/uber-apk-signer || echo "[skip] uber-apk-signer" ; \
+    [ -f ${DT}/jar/r8.jar ] && printf '#!/bin/sh\nexec java -cp %s/jar/r8.jar com.android.tools.r8.R8 "$@"\n' "${DT}" > /usr/local/bin/r8 && chmod +x /usr/local/bin/r8 || echo "[skip] r8" ; \
+    [ -f ${DT}/jar/r8.jar ] && printf '#!/bin/sh\nexec java -cp %s/jar/r8.jar com.android.tools.r8.D8 "$@"\n' "${DT}" > /usr/local/bin/d8 && chmod +x /usr/local/bin/d8 || echo "[skip] d8" ; \
+    for t in aapt2 zipalign dexdump ; do \
+      [ -x ${DT}/bin/$t ] && printf '#!/bin/sh\nexec %s/bin/%s "$@"\n' "${DT}" "$t" > /usr/local/bin/$t && chmod +x /usr/local/bin/$t || echo "[skip] $t" ; \
+    done ; \
+    true
+
+# profile：交互式 shell 自动加载
+RUN printf '%s\n' \
+    'export PATH="/opt/jvm-langs/kotlinc/bin:/opt/jvm-langs/groovy/bin:/opt/jvm-langs/scala/bin:/opt/dt/bin:/opt/jadx/bin:/usr/local/bin:$PATH"' \
+    'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk' \
+    'export GOPROXY=https://goproxy.cn,direct' \
+    'export npm_config_registry=https://registry.npmmirror.com' \
+    > /etc/profile.d/20-langs.sh && chmod +x /etc/profile.d/20-langs.sh
+
+# 工作目录（ds-agent 会把这里挂到 /w）
+RUN mkdir -p /w
+WORKDIR /w
+
+# 自检：容器内也能逐项确认（对应 dsmod 的 verify.sh）
+COPY docker/verify-full.sh /usr/local/bin/verify-full
+RUN chmod +x /usr/local/bin/verify-full
+
+CMD ["sleep", "infinity"]

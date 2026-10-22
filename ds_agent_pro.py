@@ -42,11 +42,14 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from mcp_client import MCPClient, load_servers
+from mcp_client import MCPClient, load_servers, make_client
 from terminal import Terminal
 from debug_advisor import DebugAdvisor, needs_test, test_nudge
 from arch_cards import build_arch_prompt, skeleton_for
 from intervene import (Intervention, CONTINUE, ROLLBACK, MANUAL, HINT, ABORT)
+from skills import SkillBook, ensure_builtin
+from streaming import (StreamRenderer, iter_stream, FenceScanner,
+                       IdleGate, ToolCallAccumulator)
 
 # ----------------------------- 配置 -----------------------------
 MODEL = os.environ.get("DS_MODEL", "deepseek-v4-pro")
@@ -58,6 +61,12 @@ TIMEOUT = int(os.environ.get("DS_TIMEOUT", "30"))
 MAX_ROUNDS = int(os.environ.get("DS_ROUNDS", "20"))
 # 全局看门狗（对应 dsmod 的 WATCHDOG，它用 Handler.postDelayed 15s 保底）
 MAX_WALL = int(os.environ.get("DS_WALL", "900"))      # 整个任务的时间上限（秒）
+# 流式输出：模型边想边看得见（对应 dsmod 的 IDLE_MS 那套显示侧能力）
+STREAM = os.environ.get("DS_STREAM", "1") != "0"
+SHOW_REASON = os.environ.get("DS_STREAM_REASON", "1") != "0"
+IDLE_MS = int(os.environ.get("DS_IDLE_MS", "1500"))   # 与 dsmod 的 0x5dc 对齐
+# Skill 抽象层（对齐 dsmod 的第三种围栏类型）
+
 MAX_OUT = int(os.environ.get("DS_MAX_OUT", "20000"))
 THINKING = os.environ.get("DS_THINKING", "0") == "1"
 SNAPSHOT_ON = os.environ.get("DS_SNAPSHOT", "1") == "1"
@@ -65,6 +74,10 @@ MEMORY = os.environ.get("DS_MEMORY", "512m")
 CPUS = os.environ.get("DS_CPUS", "1")
 HERE = Path(__file__).resolve().parent          # 脚本所在目录
 MCP_CFG = os.environ.get("DS_MCP_CFG") or str(HERE / "mcp.json")
+
+# Skill 抽象层（对齐 dsmod 的第三种围栏类型），必须在 HERE 之后
+SKILL_DIR = os.environ.get("DS_SKILL_DIR") or str(HERE / "skills")
+SKILL_MAX = int(os.environ.get("DS_SKILL_MAX", "2"))
 
 # 沙箱外部链接：授权给模型的真实文件夹（手机目录 / /sdcard/Download 等）
 # 多路径用 : 分隔；设为只读用 DS_FS_READONLY=1
@@ -275,6 +288,42 @@ class Snapshot:
         return f"✅ 已回退 {steps} 步 → {cur.strip()[:8]}（原状态已存为保险点，可用 git reflog 找回）"
 
 
+def _safe_name(s: str) -> str:
+    """OpenAI 函数名只允许 [a-zA-Z0-9_-]"""
+    return "".join(c if (c.isalnum() or c in "_-") else "_" for c in s)[:60]
+
+
+def _fake_msg(content, reasoning=None):
+    """把流式的文本结果包装成与非流式一致的消息对象。"""
+    import types
+    m = types.SimpleNamespace()
+    m.content = content
+    m.reasoning_content = reasoning
+    m.tool_calls = None
+    return m
+
+
+def _blocks_to_calls(blocks):
+    """
+    流式下没有结构化 tool_calls 时，用围栏兜底（对齐 dsmod 的做法）。
+    只处理 bash/sh 围栏 —— 这是唯一能安全自动执行的一类。
+    其余语言围栏只展示、不执行。
+    """
+    import types
+    out = []
+    for i, (lang, code) in enumerate(blocks):
+        if lang not in ("bash", "sh", "shell", "zsh"):
+            continue
+        t = types.SimpleNamespace()
+        f = types.SimpleNamespace()
+        f.name = "run_shell"
+        f.arguments = json.dumps({"cmd": code}, ensure_ascii=False)
+        t.id = f"fence_{i}"
+        t.function = f
+        out.append(t)
+    return out or None
+
+
 # ============================ 3. MCP 集成 ============================
 class MCPHub:
     def __init__(self, cfg_path):
@@ -287,21 +336,21 @@ class MCPHub:
         specs = load_servers(self.cfg_path)
         if not specs:
             return []
-        for name, command, args, env in specs:
-            if not command:
-                continue
+        for name, kind, spec in specs:
             try:
-                c = MCPClient(name, command, args, env)
-                c.start()
+                c = make_client(name, kind, spec, timeout=TIMEOUT * 2)
+                c.start()               # stdio 起进程；http 的 SSE 会在这里建流
                 c.initialize()
                 c.list_tools()
                 self.clients[name] = c
-                for t in c.to_openai_tools():
+                for t in c.to_openai_tools(prefix=f"mcp_{_safe_name(name)}"):
                     fname = t["function"]["name"]
                     real = fname.split("__", 1)[1]
                     self.mapping[fname] = (name, real)
                     self.tools.append(t)
-                print(f"[MCP] {name}: 已连接，{len(c.tools)} 个工具", file=sys.stderr)
+                tag = {"stdio": "本地进程", "http": "远端 HTTP"}[kind]
+                print(f"[MCP] {name}（{tag}）: 已连接，{len(c.tools)} 个工具",
+                      file=sys.stderr)
             except Exception as e:
                 print(f"[MCP] {name}: 连接失败 —— {type(e).__name__}: {e}", file=sys.stderr)
         return self.tools
@@ -410,6 +459,12 @@ def build_system(sandbox, task=""):
         skel = skeleton_for(task)
         if skel:
             s += "\n【可用骨架】按需取用，不要照抄：\n" + skel
+    # Skill：按 trigger 命中的方法学，最多 SKILL_MAX 个，避免提示词膨胀
+    try:
+        book = SkillBook(SKILL_DIR)
+        s += book.render(task, limit=SKILL_MAX)
+    except Exception:
+        pass
     if not FS_ROOTS:
         return s
     rw = "只读，禁止写入/删除" if FS_READONLY else "可读写"
@@ -432,6 +487,7 @@ def run(task, sandbox, snap, hub, tools, dispatch, client=None):
     messages = [{"role": "system", "content": build_system(sandbox, task)},
                 {"role": "user", "content": task}]
     seen = set()
+    skip_count = {}          # 记录"被跳过的重复调用"次数，防止无限原地打转
     advisor = DebugAdvisor(
         max_same=int(os.environ.get("DS_MAX_SAME", "3")),
         max_fixes=int(os.environ.get("DS_MAX_FIXES", "3")),
@@ -460,7 +516,39 @@ def run(task, sandbox, snap, hub, tools, dispatch, client=None):
         kw = dict(model=MODEL, messages=messages, tools=tools)
         if THINKING:
             kw["extra_body"] = {"thinking": {"type": "enabled"}}
-        msg = client.chat.completions.create(**kw).choices[0].message
+
+        if STREAM:
+            # 边生成边显示；失败自动退回非流式，不影响主流程
+            try:
+                kw["stream"] = True
+                renderer = StreamRenderer(show_reasoning=SHOW_REASON)
+                idle = IdleGate(idle_ms=IDLE_MS)
+                scanner = FenceScanner()
+                acc = ToolCallAccumulator()
+                buf = {"content": [], "reasoning": []}
+                blocks = []
+                for kind, payload in iter_stream(client.chat.completions.create(**kw)):
+                    idle.touch()
+                    if kind == "tool_call":
+                        acc.feed(payload)       # 参数被切成碎片，累积到最后再解析
+                        continue
+                    renderer.feed(payload, kind)
+                    buf[kind].append(payload)
+                    blocks += scanner.feed(payload)
+                blocks += scanner.flush()
+                renderer.finish()
+                msg = _fake_msg("".join(buf["content"]) or None,
+                                "".join(buf["reasoning"]) or None)
+                # 优先用结构化 tool_calls；没有时才用围栏兜底
+                msg.tool_calls = acc.build()
+                if not msg.tool_calls and blocks:
+                    msg.tool_calls = _blocks_to_calls(blocks)
+            except Exception as e:
+                print(f"[流式失败，回退非流式] {type(e).__name__}: {e}", file=sys.stderr)
+                kw.pop("stream", None)
+                msg = client.chat.completions.create(**kw).choices[0].message
+        else:
+            msg = client.chat.completions.create(**kw).choices[0].message
         messages.append(msg)          # 整条回传，thinking 模式下 reasoning_content 不丢
 
         if not msg.tool_calls:
@@ -478,7 +566,13 @@ def run(task, sandbox, snap, hub, tools, dispatch, client=None):
             key = hashlib.md5(f"{name}:{json.dumps(args, sort_keys=True)}".encode()).hexdigest()
 
             if key in seen:
-                result = "[跳过] 完全相同的调用已执行过，请勿原地打转；换个思路或直接给结论。"
+                skip_count[key] = skip_count.get(key, 0) + 1
+                if skip_count[key] >= 3:
+                    result = ("[已拒绝] 这个调用已重复 3 次以上且从未解决问题。"
+                              "必须换一种完全不同的做法，或直接给出结论并说明卡在哪。")
+                else:
+                    result = ("[跳过] 完全相同的调用已执行过，请勿原地打转；"
+                              "请换一种做法（改参数、换工具、或先做最小复现）。")
             elif name in dispatch:
                 try:
                     result = dispatch[name](args)
@@ -538,6 +632,16 @@ def run(task, sandbox, snap, hub, tools, dispatch, client=None):
     print(f"[调试汇总] {advisor.summary()}")
 
 
+def ensure_builtin_skills():
+    """首次运行把内置 skill 落盘，用户可直接编辑。"""
+    try:
+        written = ensure_builtin(SKILL_DIR)
+        if written:
+            print(f"[skill] 已生成内置方法: {', '.join(written)}", file=sys.stderr)
+    except Exception as e:
+        print(f"[skill] 初始化失败: {type(e).__name__}: {e}", file=sys.stderr)
+
+
 def ensure_mcp_cfg():
     """自动生成 mcp.json。若设置了 DS_FS_ROOTS，同步写入 filesystem server。"""
     cfg = {}
@@ -593,6 +697,7 @@ def main():
     if not os.environ.get("DEEPSEEK_API_KEY") and "--mcp-only" not in args:
         sys.exit("请先 export DEEPSEEK_API_KEY=sk-xxx")
 
+    ensure_builtin_skills()
     ensure_mcp_cfg()
     hub = MCPHub(MCP_CFG)
     mcp_tools = hub.start()
