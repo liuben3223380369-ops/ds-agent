@@ -44,6 +44,8 @@ from openai import OpenAI
 
 from mcp_client import MCPClient, load_servers
 from terminal import Terminal
+from debug_advisor import DebugAdvisor, needs_test, test_nudge
+from arch_cards import build_arch_prompt, skeleton_for
 
 # ----------------------------- 配置 -----------------------------
 MODEL = os.environ.get("DS_MODEL", "deepseek-v4-pro")
@@ -397,9 +399,16 @@ def make_dispatch(sandbox: Sandbox, snap: Snapshot, hub: MCPHub):
     return d
 
 
-def build_system(sandbox):
-    """在系统提示里告诉模型：外部目录在哪、容器里怎么访问、能读能不能写。"""
+def build_system(sandbox, task=""):
+    """在系统提示里告诉模型：外部目录在哪、容器里怎么访问、能读能不能写；
+    涉及模型/训练时再按需注入架构知识。"""
     s = SYSTEM
+    arch = build_arch_prompt(task)
+    if arch:
+        s += "\n" + arch
+        skel = skeleton_for(task)
+        if skel:
+            s += "\n【可用骨架】按需取用，不要照抄：\n" + skel
     if not FS_ROOTS:
         return s
     rw = "只读，禁止写入/删除" if FS_READONLY else "可读写"
@@ -419,9 +428,14 @@ def build_system(sandbox):
 def run(task, sandbox, snap, hub, tools, dispatch, client=None):
     client = client or OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"],
                               base_url="https://api.deepseek.com")
-    messages = [{"role": "system", "content": build_system(sandbox)},
+    messages = [{"role": "system", "content": build_system(sandbox, task)},
                 {"role": "user", "content": task}]
     seen = set()
+    advisor = DebugAdvisor(
+        max_same=int(os.environ.get("DS_MAX_SAME", "3")),
+        max_fixes=int(os.environ.get("DS_MAX_FIXES", "3")),
+        max_stall=int(os.environ.get("DS_MAX_STALL", "4")),
+    )
     t0 = time.time()
 
     for rnd in range(1, MAX_ROUNDS + 1):
@@ -459,10 +473,25 @@ def run(task, sandbox, snap, hub, tools, dispatch, client=None):
                 result = f"[未知工具] {name}"
 
             seen.add(key)
+
+            # 调试顾问：识别重复失败，按次数升级建议，避免原地打转
+            advice = advisor.observe(name, args, result)
+            # 写了实现却没有任何断言/测试 → 提示补一个最小验证
+            if (name in ("write_file", "run_python") and not advice
+                    and needs_test(args.get("content") or args.get("code", ""))):
+                advice = test_nudge()
+
+            body = clip(result)
+            if advice:
+                body = body + "\n\n" + advice
+
             print(f"\n--- 轮{rnd} · {name} ---\n{clip(result, 2000)}")
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": clip(result)})
+            if advice:
+                print(f"  {advice.splitlines()[0]}")
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": body})
 
     print(f"\n[停止] 已达 {MAX_ROUNDS} 轮上限，未收敛。可用 --rollback N 回退。")
+    print(f"[调试汇总] {advisor.summary()}")
 
 
 def ensure_mcp_cfg():

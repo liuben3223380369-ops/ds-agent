@@ -46,9 +46,44 @@ docker pull python:3.12-slim
 
 没有 Docker 也能跑，会**自动回退本地执行**并在启动时警告。本地模式 = 你的真实环境，跑不信任代码等于裸奔。
 
-## 三项能力
+## 六项能力
 
-### 0. 持久终端会话（对照 dsmod 优化）
+### 0. 调试链优化（不再原地打转）
+
+朴素循环最大的浪费：模型用同一种修法反复试同一个错，20 轮全在打补丁。
+
+`debug_advisor.py` 用两个指纹解决：
+
+- **错误指纹** = 异常类型 + 文件 + 函数名（**不含行号**，改位置也算同一个错）
+- **修复指纹** = 用什么工具改了什么 → 统计"换过几种修法"
+
+按「重复次数 × 修法种类」分档给建议：
+
+| 状态 | 给模型的指令 |
+|---|---|
+| 第 1 次 | 分类 + 定位（语法/导入/类型/算术/路径/逻辑/超时/OOM 共 8 类） |
+| 同错 ≥3 次 | 停止微调，完整读一遍代码，确认假设成立 |
+| 同错 ≥3 次 **且** 换过 ≥3 种修法 | 写最小复现，或 `git_rollback` 换条路重写 |
+| 连续 4 轮无进展 | 缩小问题 / 回退重来，二选一 |
+
+另有：成功信号自动重置停滞计数；写了实现却无断言时提示补最小验证。
+
+### 1. 架构知识按需注入
+
+**结论先说：绝大多数任务用不上，常驻反而诱发过度设计。** 所以做成条件注入——
+只有任务确实涉及模型/训练才加载，且注入的是**工程坑位**而非架构科普。
+
+```python
+is_ml_task("写一个快速排序")        # False → 注入 0 字符
+is_ml_task("用 pytorch 训练分类")    # True  → 只给基础卡（稳定性检查 6 条）
+is_arch_task("实现 mamba 混合架构")  # True  → 追加 2026 前沿卡
+```
+
+前沿卡覆盖（已核对 2026 公开资料）：混合架构比例 1:5~1:8、DeepSeek V4 的 CSA/HCA、
+mHC 的 Sinkhorn 约束为何能防数值爆炸、Muon+AdamW 分工、MoE 的 expert collapse、
+MLA 压缩。**每条都标注了坑在哪，以及"什么时候不该用"。**
+
+### 2. 持久终端会话（对照 dsmod 优化）
 
 `terminal.py` 是对 GitHub 项目 `dsmod-*` 终端部分的针对性重写。核心差异：
 
@@ -67,7 +102,7 @@ docker pull python:3.12-slim
 模型侧获得的能力：可以 `cd` 后连续执行、`export` 后续有效、每次返回带 `[cwd]`；
 另有 `shell_reset` 工具重置被污染的状态。
 
-### 1. Docker 沙箱
+### 3. Docker 沙箱
 
 容器参数：`--network=none --memory=512m --cpus=1 --pids-limit=128`，工作目录只读挂载为 `/w`。
 
@@ -77,7 +112,25 @@ docker pull python:3.12-slim
 
 另有两层兜底，容器内外都生效：命令黑名单（`rm -rf /`、`dd if=`、fork 炸弹等）、路径逃逸检查（拒绝 `../../etc/passwd`）、超时熔断。
 
-### 2. MCP 支持
+### 4. 文件系统外链（手机 / 外部文件夹）
+
+用 `DS_FS_ROOTS` 授权真实目录给模型，多路径用 `:` 分隔：
+
+```bash
+# 可读写
+DS_FS_ROOTS="/sdcard/Download:/sdcard/Documents" python3 ds_agent_pro.py "..."
+
+# 只读（推荐先这样跑，确认行为没问题再放开写）
+DS_FS_READONLY=1 DS_FS_ROOTS="/sdcard/DCIM" python3 ds_agent_pro.py "..."
+```
+
+启动时自动挂上 filesystem server，10 个工具：`fs_roots / fs_list / fs_read / fs_write / fs_mkdir / fs_delete / fs_move / fs_copy / fs_stat / fs_search`。
+
+授权机制是**白名单**：只有显式列出的目录能碰，其余一律拒绝。已验证 `/etc/passwd`、`/root/.ssh/id_rsa`、`..` 穿越全部被拦。
+
+Docker 模式下外部目录会同步挂进容器（`/ext/0`、`/ext/1`…），代码里可用绝对路径访问；只读模式一律 `:ro` 挂载。
+
+### 5. MCP 支持
 
 `mcp.json` 用 Claude Desktop 同款格式：
 
@@ -102,25 +155,7 @@ python3 ds_agent_pro.py --mcp-only
 
 `mcp_demo_server.py` 是纯标准库的 Server 模板，加工具只需往 `TOOLS` 和 `HANDLERS` 里各加一项。
 
-### 3. 文件系统外链（手机 / 外部文件夹）
-
-用 `DS_FS_ROOTS` 授权真实目录给模型，多路径用 `:` 分隔：
-
-```bash
-# 可读写
-DS_FS_ROOTS="/sdcard/Download:/sdcard/Documents" python3 ds_agent_pro.py "..."
-
-# 只读（推荐先这样跑，确认行为没问题再放开写）
-DS_FS_READONLY=1 DS_FS_ROOTS="/sdcard/DCIM" python3 ds_agent_pro.py "..."
-```
-
-启动时自动挂上 filesystem server，10 个工具：`fs_roots / fs_list / fs_read / fs_write / fs_mkdir / fs_delete / fs_move / fs_copy / fs_stat / fs_search`。
-
-授权机制是**白名单**：只有显式列出的目录能碰，其余一律拒绝。已验证 `/etc/passwd`、`/root/.ssh/id_rsa`、`..` 穿越全部被拦。
-
-Docker 模式下外部目录会同步挂进容器（`/ext/0`、`/ext/1`…），代码里可用绝对路径访问；只读模式一律 `:ro` 挂载。
-
-### 4. Git 快照回滚
+### 6. Git 快照回滚
 
 每步改动自动 commit。跑崩了三种回法：
 
@@ -151,6 +186,9 @@ python3 ds_agent_pro.py --rollback 3     # 回退 3 步
 | `DS_FS_ROOTS` | 空 | 外链目录，`:` 分隔，如 `/sdcard/Download:/sdcard/Documents` |
 | `DS_FS_READONLY` | `0` | 设 `1` 外链只读，写工具直接不暴露给模型 |
 | `DS_FS_MAXFILE` | `2MB` | 单次读取上限，超出提示分段读 |
+| `DS_MAX_SAME` | `3` | 同一错误出现几次后升级建议 |
+| `DS_MAX_FIXES` | `3` | 换过几种修法后判定"思路有问题" |
+| `DS_MAX_STALL` | `4` | 连续几轮无进展后强制换策略 |
 
 ## 手机（Termux）专用说明
 
@@ -195,6 +233,19 @@ python3 ds_agent_pro.py "统计下载目录里所有 csv 的行数，写个脚�
 - 外链集成：`DS_FS_ROOTS` 自动挂载，系统提示正确告知模型可用路径
 - 终端：120 次混合命令 0 失败、`exit 0/1/2/42` 码全对、超时精确熔断并重建
 - 终端竞态：BrokenPipe 与空输出两种场景均自动重建重试，已压测确认不再复现
+- 调试顾问：8 类错误分类全对、指纹判定正确、重复 3 次×3 修法触发升级建议
+- 架构卡片：普通任务注入 0 字符、ML 任务只给基础卡、架构任务追加前沿卡
+
+## 持续集成
+
+`.github/workflows/ci.yml` 在每次 push / PR 时跑 8 组断言（语法、MCP 协议、
+终端状态与超时、60 次压测、调试顾问、架构卡片、安全隔离、setup.sh）。
+
+本地先自检再 push，断言与 CI 完全一致：
+
+```bash
+python3 selftest.py
+```
 
 ## 文件
 
@@ -202,6 +253,9 @@ python3 ds_agent_pro.py "统计下载目录里所有 csv 的行数，写个脚�
 |---|---|
 | `ds_agent_pro.py` | 主程序：沙箱 + git + MCP + 收敛控制 + 外链挂载 |
 | `terminal.py` | 持久终端会话（对 dsmod execOnce 的重写） |
+| `debug_advisor.py` | 调试顾问：错误分类、双指纹、自适应升级建议 |
+| `arch_cards.py` | 架构知识按需注入（工程坑位取向，非架构科普） |
+| `selftest.py` | 本地自检（与 CI 同断言，push 前跑一遍） |
 | `COMPARE.md` | 与 dsmod 终端实现的逐项对比与实测数据 |
 | `mcp_fs_server.py` | 文件系统 MCP Server（白名单授权，读写可切） |
 | `mcp_client.py` | MCP stdio 客户端（JSON-RPC 2.0，纯标准库） |

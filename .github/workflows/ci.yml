@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check
+        run: |
+          python -m compileall -q *.py
+          echo "✅ 语法检查通过"
+
+      - name: MCP protocol end-to-end
+        run: |
+          python - <<'EOF'
+          import sys, json
+          sys.path.insert(0, '.')
+          from mcp_client import MCPClient
+
+          c = MCPClient("demo", sys.executable, ["mcp_demo_server.py"])
+          c.start()
+          info = c.initialize()
+          assert info.get("serverInfo"), "initialize 未返回 serverInfo"
+          tools = c.list_tools()
+          assert len(tools) == 3, f"工具数应为 3，实际 {len(tools)}"
+          assert c.call_tool("get_time", {}), "get_time 无返回"
+          assert "未知工具" in c.call_tool("nope", {})
+          c.close()
+          print("✅ MCP demo server 握手/列工具/调用/错误分支 全通过")
+
+          c2 = MCPClient("fs", sys.executable, ["mcp_fs_server.py"],
+                         env={"MCP_FS_ROOTS": "/tmp"})
+          c2.start(); c2.initialize()
+          names = [t["name"] for t in c2.list_tools()]
+          assert "fs_read" in names, f"缺少 fs_read: {names}"
+          # 越界必须被拒绝
+          r = c2.call_tool("fs_read", {"path": "/etc/shadow"})
+          assert "PermissionError" in r, f"越界未被拦截: {r}"
+          c2.close()
+          print("✅ filesystem server 工具列表 + 越界拦截 通过")
+          EOF
+
+      - name: Terminal session (state, exit code, timeout)
+        run: |
+          python - <<'EOF'
+          import sys, time
+          sys.path.insert(0, '.')
+          from terminal import Terminal
+
+          t = Terminal("/tmp/ci_term", "local")
+          # 1. cwd 跨调用保留
+          t.run("cd /tmp && pwd")
+          assert "/tmp" in t.run("pwd"), "cwd 未保留"
+          # 2. 环境变量跨调用保留
+          t.run("export CIVAR=hello")
+          assert "hello" in t.run("echo $CIVAR"), "环境变量未保留"
+          # 3. exit code 正确
+          for code in (0, 1, 42):
+              assert f"[exit={code}]" in t.run(f"echo x; exit {code}"), f"exit {code} 回传错误"
+          # 4. 超时可靠熔断
+          s = time.time()
+          r = t.run("while true; do sleep 1; done", timeout=4)
+          assert "TIMEOUT" in r, "超时未熔断"
+          assert time.time() - s < 10, "熔断耗时过长"
+          # 5. 熔断后会话可用
+          assert "alive" in t.run("echo alive"), "熔断后会话未恢复"
+          t.close()
+          print("✅ 终端：cwd/env 保留、exit 码、超时熔断、自动重建 全通过")
+          EOF
+
+      - name: Reliability stress (60 mixed commands)
+        run: |
+          python - <<'EOF'
+          import sys
+          sys.path.insert(0, '.')
+          from terminal import Terminal
+
+          t = Terminal("/tmp/ci_stress", "local")
+          fail = []
+          for i in range(60):
+              cmd = (f"echo n{i}; exit 0" if i % 3 == 0
+                     else f"echo n{i}; echo e{i} >&2" if i % 5 == 0 else f"echo n{i}")
+              if f"n{i}" not in t.run(cmd):
+                  fail.append(i)
+          t.close()
+          assert not fail, f"以下轮次解析失败: {fail}"
+          print("✅ 60 次混合命令（含 exit / stderr）0 失败")
+          EOF
+
+      - name: Debug advisor (error classification & escalation)
+        run: |
+          python - <<'EOF'
+          import sys
+          sys.path.insert(0, '.')
+          from debug_advisor import parse_error, categorize, fingerprint, DebugAdvisor
+
+          cases = [
+              ("...\nZeroDivisionError: division by zero", "arith"),
+              ("...\nTypeError: bad", "type"),
+              ("ModuleNotFoundError: No module named 'x'", "import"),
+              ("...\nAssertionError: got 5", "logic"),
+              ("CUDA out of memory", "oom"),
+              ("  File \"m.py\", line 3\nSyntaxError: invalid syntax", "syntax"),
+              ("FileNotFoundError: [Errno 2] no such file", "io"),
+          ]
+          for txt, want in cases:
+              got, _ = categorize(parse_error(txt), txt)
+              assert got == want, f"分类错误: 期望 {want} 实际 {got}"
+
+          # 指纹：改行号算同一个错，换函数算不同的错
+          a = parse_error('File "s.py", line 10, in run\nZeroDivisionError: x')
+          b = parse_error('File "s.py", line 88, in run\nZeroDivisionError: x')
+          d = parse_error('File "s.py", line 10, in other\nZeroDivisionError: x')
+          assert fingerprint(a) == fingerprint(b), "同函数不同行号应视为同一个错"
+          assert fingerprint(a) != fingerprint(d), "不同函数应视为不同的错"
+
+          # 升级：重复 3 次且换了 3 种修法 → 必须出现警告
+          ad = DebugAdvisor()
+          err = 'File "s.py", line 10, in run\nZeroDivisionError: x'
+          warned = False
+          for i in range(3):
+              r = ad.observe("run_python", {"code": f"fix{i}"}, err)
+              if r and "⚠️" in r:
+                  warned = True
+          assert warned, "重复失败未触发升级建议"
+          print("✅ 调试顾问：7 类分类、指纹判定、升级建议 全通过")
+          EOF
+
+      - name: Arch cards (on-demand injection)
+        run: |
+          python - <<'EOF'
+          import sys
+          sys.path.insert(0, '.')
+          from arch_cards import is_ml_task, is_arch_task, build_arch_prompt, skeleton_for
+
+          assert not is_ml_task("写一个快速排序"), "普通任务不应注入架构知识"
+          assert len(build_arch_prompt("写一个快排")) == 0, "普通任务注入应为空"
+          assert is_ml_task("用 pytorch 训练分类模型"), "ML 任务应识别"
+          assert is_arch_task("实现 mamba 混合架构"), "架构任务应识别"
+          # 架构类注入应比普通 ML 更长（多了前沿卡）
+          assert len(build_arch_prompt("实现 mamba 混合架构")) > \
+                 len(build_arch_prompt("用 torch 训练模型")), "架构卡未额外注入"
+          assert "HybridBlock" in skeleton_for("mamba 混合架构"), "骨架选择错误"
+          print("✅ 架构卡片：按需注入判定与骨架选择 通过")
+          EOF
+
+      - name: Path sandbox & shell safety
+        run: |
+          python - <<'EOF'
+          import sys, os
+          sys.path.insert(0, '.')
+          os.environ["DS_WORKDIR"] = "/tmp/ci_safe"
+          import ds_agent_pro as A
+
+          os.makedirs("/tmp/ci_safe", exist_ok=True)
+          try:
+              A.safe_path("../../etc/passwd")
+              raise AssertionError("路径逃逸未被拦截")
+          except ValueError:
+              pass
+
+          sb = A.Sandbox(A.ROOT, "local", [])
+          assert "已拦截" in sb.run_shell("rm -rf / tmp"), "危险命令未被拦截"
+          assert "PermissionError" not in sb.run_shell("echo ok")
+          sb.close()
+          print("✅ 路径逃逸与危险命令拦截 通过")
+          EOF
+
+      - name: setup.sh syntax
+        run: |
+          sh -n setup.sh && echo "✅ setup.sh 语法通过"
