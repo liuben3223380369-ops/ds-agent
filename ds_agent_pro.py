@@ -46,6 +46,7 @@ from mcp_client import MCPClient, load_servers
 from terminal import Terminal
 from debug_advisor import DebugAdvisor, needs_test, test_nudge
 from arch_cards import build_arch_prompt, skeleton_for
+from intervene import (Intervention, CONTINUE, ROLLBACK, MANUAL, HINT, ABORT)
 
 # ----------------------------- 配置 -----------------------------
 MODEL = os.environ.get("DS_MODEL", "deepseek-v4-pro")
@@ -437,12 +438,25 @@ def run(task, sandbox, snap, hub, tools, dispatch, client=None):
         max_stall=int(os.environ.get("DS_MAX_STALL", "4")),
     )
     t0 = time.time()
+    gate = Intervention(
+        ROOT, snap=snap, sandbox=sandbox, advisor=advisor,
+        stall=int(os.environ.get("DS_ITER_STALL", "3")),
+        same=int(os.environ.get("DS_ITER_SAME", "4")),
+        budget=int(os.environ.get("DS_ITER_TIME", "240")),
+        enabled=os.environ.get("DS_INTERVENE", "1") != "0",
+    )
 
     for rnd in range(1, MAX_ROUNDS + 1):
         if time.time() - t0 > MAX_WALL:          # 看门狗：不看轮次，只看墙钟
             print(f"\n[看门狗] 已运行 {int(time.time()-t0)}s，超过上限 {MAX_WALL}s，强制停止。"
                   f"\n可用 --rollback N 回退，或调大 DS_WALL。")
             return
+
+        # 用户的提示在下一轮请求前注入
+        note = gate.drain_notes()
+        if note:
+            messages.append({"role": "user", "content": note})
+
         kw = dict(model=MODEL, messages=messages, tools=tools)
         if THINKING:
             kw["extra_body"] = {"thinking": {"type": "enabled"}}
@@ -454,6 +468,7 @@ def run(task, sandbox, snap, hub, tools, dispatch, client=None):
             snap.commit("任务完成")
             return
 
+        round_ok = False
         for tc in msg.tool_calls:
             name = tc.function.name
             try:
@@ -489,6 +504,35 @@ def run(task, sandbox, snap, hub, tools, dispatch, client=None):
             if advice:
                 print(f"  {advice.splitlines()[0]}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": body})
+
+            # 本轮是否有实质进展：执行成功且无异常
+            if "[exit=0]" in result and "[调试助手]" not in body:
+                round_ok = True
+
+        gate.tick(round_ok)
+
+        # 主动介入：卡住就停下来问人，而不是烧 token 硬撑
+        reason = gate.should_intervene()
+        if reason:
+            decision, data = gate.ask(task, reason)
+            if decision == ABORT:
+                print("\n[已放弃] 现场保留在工作目录与 git 快照中。")
+                return
+            if decision == ROLLBACK:
+                print(f"\n[回滚] {snap.rollback(data or 1)}")
+                gate.fail_streak = 0
+                continue
+            if decision == MANUAL:
+                summary = gate.manual_session()
+                gate.add_note("用户手动介入并修改了代码：\n" + summary
+                              + "\n请读取当前文件最新内容，在此基础上继续，"
+                                "不要重复用户已经做过的修改。")
+                continue
+            if decision == HINT:
+                gate.add_note(data)
+                continue
+            # CONTINUE：重置计数，再给一轮机会
+            gate.fail_streak = 0
 
     print(f"\n[停止] 已达 {MAX_ROUNDS} 轮上限，未收敛。可用 --rollback N 回退。")
     print(f"[调试汇总] {advisor.summary()}")

@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 venv/
 
+# 诊断报告（运行时产生）
+diagnostics/
+
 # 工作目录与会话状态
 workspace/
 .dsrun/

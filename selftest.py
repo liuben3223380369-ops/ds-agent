@@ -148,6 +148,86 @@ def t_safe():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def t_intervene():
+    import tempfile
+    import builtins
+    from intervene import Intervention, CONTINUE, ROLLBACK, MANUAL, HINT, ABORT
+    from debug_advisor import DebugAdvisor
+
+    d = tempfile.mkdtemp()
+
+    # 触发条件：连续失败
+    g = Intervention(d, stall=3)
+    assert g.should_intervene() is None, "初始不应触发"
+    for _ in range(3):
+        g.tick(False)
+    assert g.should_intervene(), "连续 3 轮失败应触发"
+
+    # 触发条件：同一错误累计
+    g2 = Intervention(d, stall=99, same=4)
+    ad = DebugAdvisor(); g2.advisor = ad
+    err = 'File "s.py", line 10, in run\nZeroDivisionError: x'
+    for i in range(4):
+        ad.observe("run_python", {"code": f"f{i}"}, err)
+    g2.tick(False)
+    assert g2.should_intervene(), "同错 4 次应触发"
+
+    # 成功信号重置
+    g3 = Intervention(d, stall=3)
+    g3.tick(False); g3.tick(False)
+    assert not g3.should_intervene(), "2 连败不应触发"
+    g3.tick(True)
+    assert g3.fail_streak == 0, "成功后未重置"
+
+    # 报告落盘且不覆盖（同秒多次）
+    g4 = Intervention(d)
+    paths = [g4.save_report("x") for _ in range(3)]
+    assert all(p and p.exists() for p in paths), "报告未落盘"
+    assert len({p.name for p in paths}) == 3, "同秒报告互相覆盖"
+
+    # 决策解析（模拟输入）
+    def ask_with(answers, gg):
+        it = iter(answers)
+        builtins.input = lambda *a, **k: next(it)
+        gg._interactive = lambda: True
+        return gg.ask("t", "r")
+    real_input = builtins.input
+    try:
+        assert ask_with(["1"], Intervention(d))[0] == CONTINUE
+        assert ask_with([""], Intervention(d))[0] == CONTINUE, "回车应默认继续"
+        assert ask_with(["2", "3"], Intervention(d)) == (ROLLBACK, 3)
+        assert ask_with(["4", "用 Decimal"], Intervention(d)) == (HINT, "用 Decimal")
+        assert ask_with(["m"], Intervention(d))[0] == MANUAL
+        assert ask_with(["x", "5"], Intervention(d))[0] == ABORT, "非法输入后应可重选"
+    finally:
+        builtins.input = real_input
+
+    # 非交互策略
+    g5 = Intervention(d); g5._interactive = lambda: False
+    saved = os.environ.get("DS_ON_STUCK")
+    try:
+        for pol, exp in [("continue", CONTINUE), ("abort", ABORT),
+                         ("rollback", ROLLBACK), ("hint", HINT)]:
+            os.environ["DS_ON_STUCK"] = pol
+            os.environ["DS_HINT"] = "换个思路"
+            assert g5.ask("t", "r")[0] == exp, f"策略 {pol} 不符"
+    finally:
+        if saved is None:
+            os.environ.pop("DS_ON_STUCK", None)
+        else:
+            os.environ["DS_ON_STUCK"] = saved
+
+    # 提示注入与清空
+    g6 = Intervention(d)
+    g6.add_note("用 Decimal"); g6.add_note("别用 float")
+    txt = g6.drain_notes()
+    assert "用 Decimal" in txt and "别用 float" in txt, "提示未全部注入"
+    assert g6.notes == [], "取出后未清空"
+
+    import shutil
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def t_setup():
     import subprocess
     here = os.path.dirname(os.path.abspath(__file__))
@@ -164,6 +244,7 @@ if __name__ == "__main__":
     check("终端可靠性压测 60 次", t_stress)
     check("调试顾问（分类/指纹/升级）", t_advisor)
     check("架构卡片（按需注入）", t_arch)
+    check("主动介入（触发/决策/注入）", t_intervene)
     check("路径与命令安全", t_safe)
     check("setup.sh 语法", t_setup)
     print(f"\n通过 {len(PASS)} / {len(PASS)+len(FAIL)}")
