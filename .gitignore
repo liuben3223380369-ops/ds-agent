@@ -1,0 +1,26 @@
+# 运行时产生的东西，不进仓库
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 工作目录与会话状态
+workspace/
+.dsrun/
+.dsenv
+.dserr_*
+*.log
+
+# 本地 MCP 配置（含本机绝对路径，用 mcp.json.example 生成）
+mcp.json
+
+# 密钥：绝不提交
+.env
+*.key
+*.pem
+token.txt
+
+# 系统
+.DS_Store
+Thumbs.db

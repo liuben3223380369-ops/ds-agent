@@ -1,0 +1,3 @@
+# 唯一依赖就是 openai SDK（兼容 OpenAI 格式的客户端）
+# 其余全部使用 Python 标准库：subprocess / json / threading / signal ...
+openai>=1.0
