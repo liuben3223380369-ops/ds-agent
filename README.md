@@ -1,6 +1,32 @@
-# ds-agent-pro
+# ds-agent
 
-DeepSeek 驱动的「自动写代码 → 运行 → 检查 → 自我修复」完整闭环。三项能力都已实现并验证。
+DeepSeek 驱动的「自动写代码 → 运行 → 检查 → 自我修复」完整闭环。
+
+仓库：<https://github.com/liuben3223380369-ops/ds-agent>
+
+## 一键部署（推荐）
+
+适用于 Termux(Android) / Linux / macOS / WSL，幂等可重复执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liuben3223380369-ops/ds-agent/main/setup.sh | sh
+```
+
+或手动：
+
+```bash
+git clone https://github.com/liuben3223380369-ops/ds-agent.git
+cd ds-agent && sh setup.sh
+```
+
+脚本会自动：装 Python 依赖（系统 pip 受限时自动建 `.venv`）、生成 `mcp.json`
+（server 路径改写为绝对路径，换目录也不会失效）、建 `workspace/`、输出下一步指引。
+
+后续更新：
+
+```bash
+cd ds-agent && git pull
+```
 
 ## 快速开始
 

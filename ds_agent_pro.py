@@ -484,8 +484,7 @@ def ensure_mcp_cfg():
             "env": {"MCP_FS_ROOTS": ":".join(str(r) for r in FS_ROOTS),
                     "MCP_FS_READONLY": "1" if FS_READONLY else "0"},
         }
-    elif "filesystem" in servers:
-        servers.pop("filesystem")      # 没配根目录就摘掉，别挂着个空壳
+    # 注意：FS_ROOTS 为空时不动 filesystem 键 —— 用户可能已手写配置，不能误删
 
     is_new = not Path(MCP_CFG).exists()
     Path(MCP_CFG).write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")

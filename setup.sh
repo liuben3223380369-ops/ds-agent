@@ -68,7 +68,22 @@ fi
 
 # ---------- 5. 生成配置 ----------
 echo "[5/5] 生成配置"
-[ -f mcp.json ] || cp mcp.json.example mcp.json
+# 把 example 里的相对路径换成绝对路径，避免在其他目录下运行时找不到 server
+if [ ! -f mcp.json ]; then
+    $PY - "$DIR" <<'PYEOF'
+import json, sys, os
+d = sys.argv[1]
+cfg = json.load(open("mcp.json.example"))
+for spec in cfg.get("mcpServers", {}).values():
+    args = spec.get("args") or []
+    if args and not os.path.isabs(args[0]):
+        spec["args"] = [os.path.join(d, args[0])] + args[1:]
+json.dump(cfg, open("mcp.json", "w"), indent=2, ensure_ascii=False)
+PYEOF
+    echo "  已生成 mcp.json（server 路径已改写为绝对路径）"
+else
+    echo "  mcp.json 已存在，保留"
+fi
 mkdir -p workspace
 
 cat > .env.example <<'EOF'
