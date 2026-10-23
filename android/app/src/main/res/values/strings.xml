@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">ds-agent</string>
+    <string name="hint_task">要做什么？例如：写个快排并验证</string>
+    <string name="hint_apikey">DeepSeek API Key（sk-…）</string>
+    <string name="run">运行</string>
+    <string name="stop">停止</string>
+</resources>

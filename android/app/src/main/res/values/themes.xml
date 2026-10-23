@@ -1,0 +1,9 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.DsAgent" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <item name="colorPrimary">#3B6FD4</item>
+        <item name="colorPrimaryVariant">#2A4F9E</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="android:statusBarColor" tools:targetApi="l">#0F1115</item>
+        <item name="android:windowBackground">#0F1115</item>
+    </style>
+</resources>

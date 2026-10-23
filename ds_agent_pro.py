@@ -51,6 +51,7 @@ from debug_advisor import DebugAdvisor, needs_test, test_nudge
 from arch_cards import build_arch_prompt, skeleton_for
 from intervene import (Intervention, CONTINUE, ROLLBACK, MANUAL, HINT, ABORT)
 from hardening import build_limits, preexec, scan_command, Gate, describe as describe_hard
+from inprocess import InProcessRunner, can_subprocess_python, can_subprocess_sh
 from skills import SkillBook, ensure_builtin
 from streaming import (StreamRenderer, iter_stream, FenceScanner,
                        IdleGate, ToolCallAccumulator)
@@ -122,7 +123,11 @@ class Sandbox:
     """docker 可用就容器隔离；不可用回退本地 subprocess（会明确警告）。"""
 
     def __init__(self, root, mode="auto", mounts=None):
-        self.root = root
+        self.root = Path(root)
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         self.mode = mode
         self.mounts = mounts or []          # [(宿主机绝对路径, 容器内路径, 读写)]
         self.note = ""
@@ -133,6 +138,10 @@ class Sandbox:
         self.term = Terminal(root, self.mode, mounts=self.mounts, image=IMAGE,
                              network=NETWORK, memory=MEMORY, cpus=CPUS,
                              limits=self.limits)
+        # 执行能力探测：Android 上没有独立 Python 解释器可 fork-exec
+        self.can_py = self.mode != "local" or can_subprocess_python()
+        self.can_sh = self.mode != "local" or can_subprocess_sh()
+        self.inproc = InProcessRunner() if not self.can_py else None
         self.gate = Gate(approver=(lambda c, w: WEB_APPROVER(c, w)) if WEB_APPROVER else None,
                          enabled=(self.mode == "local"))
         self.mode = self.term.mode          # docker 启动失败会被 Terminal 降级
@@ -142,6 +151,15 @@ class Sandbox:
             self.note += f"\n[外链] 已挂载 {len(self.mounts)} 个外部目录（{rw}）："
             for host, cpath, _ in self.mounts:
                 self.note += f"\n         {host} → 容器内 {cpath}"
+
+        # 执行能力：Android 上没有独立解释器，必须让模型知道自己处在什么环境
+        if self.mode == "local":
+            if not self.can_py:
+                self.note += ("\n[执行] ⚠️ 无独立 Python 解释器（嵌入式环境）"
+                              "—— run_python 改为进程内执行，死循环由指令预算拦截")
+            if not self.can_sh:
+                self.note += ("\n[执行] ⚠️ 无法启动 shell —— run_shell 不可用，"
+                              "请只用 run_python")
 
     @staticmethod
     def _docker_ok():
@@ -208,6 +226,9 @@ class Sandbox:
         fp.write_text(code, encoding="utf-8")
         cwd = getattr(self, "cwd", self.root)
         try:
+            # Android / 嵌入式：没有独立解释器，只能进程内执行
+            if self.inproc is not None:
+                return self.inproc.run(code, filename=rel, timeout=timeout)
             if self.mode == "docker":
                 return self._docker_run(["python", "-u", f"/w/{rel}"], timeout)
             p = subprocess.run([sys.executable, "-u", str(fp)], cwd=cwd,
@@ -356,7 +377,15 @@ class MCPHub:
         specs = load_servers(self.cfg_path)
         if not specs:
             return []
+        # 嵌入式环境（Android/Chaquopy）没有独立解释器，
+        # stdio MCP 需要 spawn 一个 Python 子进程 —— 起不来，显式跳过而不是白试。
+        no_subproc = not can_subprocess_python()
         for name, kind, spec in specs:
+            if kind == "stdio" and no_subproc:
+                print(f"[MCP] {name}: 跳过 —— 无独立 Python 解释器，"
+                      f"stdio 传输需要 spawn 子进程（可改用 HTTP 传输）",
+                      file=sys.stderr)
+                continue
             try:
                 c = make_client(name, kind, spec, timeout=TIMEOUT * 2)
                 c.start()               # stdio 起进程；http 的 SSE 会在这里建流

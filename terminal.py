@@ -61,6 +61,10 @@ class Terminal:
     def __init__(self, root, mode="auto", mounts=None, image="python:3.12-slim",
                  network="none", memory="512m", cpus="1", limits=None):
         self.root = Path(root).resolve()
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         self.mounts = mounts or []
         self.image, self.network = image, network
         self.memory, self.cpus = memory, cpus

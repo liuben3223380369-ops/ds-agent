@@ -31,3 +31,12 @@ Thumbs.db
 # 用户自定义 skill（内置三个会自动生成，其余不进仓库）
 skills/*.md
 !skills/tdd.md
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/app/src/main/python/__pycache__/
+*.pyc

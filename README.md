@@ -46,7 +46,7 @@ docker pull python:3.12-slim
 
 没有 Docker 也能跑，会**自动回退本地执行**并在启动时警告。本地模式 = 你的真实环境，跑不信任代码等于裸奔。
 
-## 十二项能力
+## 十三项能力
 
 ### 0. 主动介入（卡住就停下来问人）
 
@@ -141,7 +141,33 @@ ls skills/          # 可直接编辑，改完生效
 DS_SKILL_MAX=3 ...  # 调最多注入几个
 ```
 
-### 5. Web UI —— 服务器跑，手机访问
+### 5. Android APK（Chaquopy 打包）
+
+**这是"要 APK"的答案，但请先读 [`android/README.md`](android/README.md) 的执行能力对比。**
+
+```bash
+cd android
+./gradlew assembleDebug     # 需要本机 Python 3.13.x（仅构建期编译 .pyc）
+```
+
+产物 `app/build/outputs/apk/debug/app-debug.apk`，约 60–90 MB。
+
+核心难点是 **Android 上没有独立 Python 解释器**（`libpython3.so` 嵌进 App 进程），
+`subprocess.run([sys.executable, ...])` 直接失效。解决办法：
+
+| 失去的 | 补偿 |
+|---|---|
+| 独立 Python 进程 | `inprocess.py` 进程内执行 |
+| 超时 kill 死循环 | **指令预算**（`sys.settrace` 计数），墙钟超时杀不掉同进程字节码 |
+| `exit()` 只结束子进程 | 屏蔽该内建函数，否则它会带走整个 App |
+| stdio MCP | 显式跳过；**HTTP MCP 仍可用**（远端服务照样接） |
+
+另有两个 Chaquopy 特有的坑已处理：`__file__` 是虚拟路径（skills 改用常量落盘）、
+`DS_WORKDIR` 必须在 import 主模块**之前**设好（ROOT 在模块级就固定了）。
+
+后台不被杀靠**前台服务**；Android 15+ 强制 16KB 页对齐，故固定 Python 3.13+。
+
+### 6. Web UI —— 服务器跑，手机访问
 
 **这是推荐用法。** 安卓上没有 Docker，打包成 APK 必然把隔离降级为本地执行；
 与其在手机上裸跑 AI 生成的代码，不如让它在服务器上跑（有真正隔离），手机只做交互。
@@ -159,7 +185,7 @@ python3 ds_agent_pro.py --serve 8080
 **必须设 `DS_WEB_TOKEN`**——这个服务能执行代码，未设口令会拒绝启动。
 默认只监听 `127.0.0.1`，要局域网访问需显式设 `DS_WEB_HOST=0.0.0.0`。
 
-### 6. 本地模式加固（无 Docker 时）
+### 7. 本地模式加固（无 Docker 时）
 
 没有 Docker 时 AI 的代码跑在真实环境里。命令黑名单能被拼接绕过，
 所以做**多层**而不是单层：
@@ -176,7 +202,7 @@ rlimit 施加在**常驻 shell** 上，它 fork 出的所有命令都继承。
 
 `DS_NO_LIMIT=1` 关闭限额，`DS_LIMIT_CPU` 等可单项调。
 
-### 7. 调试链优化（不再原地打转）
+### 8. 调试链优化（不再原地打转）
 
 朴素循环最大的浪费：模型用同一种修法反复试同一个错，20 轮全在打补丁。
 
@@ -196,7 +222,7 @@ rlimit 施加在**常驻 shell** 上，它 fork 出的所有命令都继承。
 
 另有：成功信号自动重置停滞计数；写了实现却无断言时提示补最小验证。
 
-### 8. 架构知识按需注入
+### 9. 架构知识按需注入
 
 **结论先说：绝大多数任务用不上，常驻反而诱发过度设计。** 所以做成条件注入——
 只有任务确实涉及模型/训练才加载，且注入的是**工程坑位**而非架构科普。
@@ -211,7 +237,7 @@ is_arch_task("实现 mamba 混合架构")  # True  → 追加 2026 前沿卡
 mHC 的 Sinkhorn 约束为何能防数值爆炸、Muon+AdamW 分工、MoE 的 expert collapse、
 MLA 压缩。**每条都标注了坑在哪，以及"什么时候不该用"。**
 
-### 9. 持久终端会话（对照 dsmod 优化）
+### 10. 持久终端会话（对照 dsmod 优化）
 
 `terminal.py` 是对 GitHub 项目 `dsmod-*` 终端部分的针对性重写。核心差异：
 
@@ -230,7 +256,7 @@ MLA 压缩。**每条都标注了坑在哪，以及"什么时候不该用"。**
 模型侧获得的能力：可以 `cd` 后连续执行、`export` 后续有效、每次返回带 `[cwd]`；
 另有 `shell_reset` 工具重置被污染的状态。
 
-### 10. Docker 沙箱
+### 11. Docker 沙箱
 
 容器参数：`--network=none --memory=512m --cpus=1 --pids-limit=128`，工作目录只读挂载为 `/w`。
 
@@ -240,7 +266,7 @@ MLA 压缩。**每条都标注了坑在哪，以及"什么时候不该用"。**
 
 另有两层兜底，容器内外都生效：命令黑名单（`rm -rf /`、`dd if=`、fork 炸弹等）、路径逃逸检查（拒绝 `../../etc/passwd`）、超时熔断。
 
-### 11. 文件系统外链（手机 / 外部文件夹）
+### 12. 文件系统外链（手机 / 外部文件夹）
 
 用 `DS_FS_ROOTS` 授权真实目录给模型，多路径用 `:` 分隔：
 
@@ -258,7 +284,7 @@ DS_FS_READONLY=1 DS_FS_ROOTS="/sdcard/DCIM" python3 ds_agent_pro.py "..."
 
 Docker 模式下外部目录会同步挂进容器（`/ext/0`、`/ext/1`…），代码里可用绝对路径访问；只读模式一律 `:ro` 挂载。
 
-### 12. MCP 支持
+### 13. MCP 支持
 
 `mcp.json` 用 Claude Desktop 同款格式：
 
@@ -283,7 +309,7 @@ python3 ds_agent_pro.py --mcp-only
 
 `mcp_demo_server.py` 是纯标准库的 Server 模板，加工具只需往 `TOOLS` 和 `HANDLERS` 里各加一项。
 
-### 13. Git 快照回滚
+### 14. Git 快照回滚
 
 每步改动自动 commit。跑崩了三种回法：
 
@@ -336,8 +362,21 @@ python3 ds_agent_pro.py --rollback 3     # 回退 3 步
 | `DS_LIMIT_AS` | 2GB | 本地模式地址空间上限 |
 | `DS_LIMIT_NPROC` | `128` | 本地模式进程数上限 |
 | `DS_LOCAL_NET` | `0` | 设 `1` 尝试 `unshare -n` 断网（需 root） |
+| `DS_IP_BUDGET` | `30000000` | Android 进程内执行的指令预算（任务重就调大） |
 
-## 手机上怎么用（推荐路线）
+## 手机上怎么用
+
+有两条路，取决于你能不能接受隔离降级：
+
+| | **服务器跑 + 手机访问**（推荐） | **打包成 APK** |
+|---|---|---|
+| 隔离 | Docker 真隔离 | 本地执行，**无隔离** |
+| 死循环防护 | 进程边界 + 超时 kill | 仅指令预算 |
+| 需要一台常开的机器 | 是 | 否 |
+| 上手成本 | 一条命令 | 需 Android Studio + Python 3.13 |
+| 详见 | 下文 | [`android/README.md`](android/README.md) |
+
+### 路线 A：服务器跑 + 手机访问（推荐）
 
 **方案：服务器跑 + 手机访问。** 手机上没有 Docker，直接在 Termux 跑等于让 AI 的代码
 在你真实环境里执行。
@@ -407,7 +446,7 @@ python3 ds_agent_pro.py "统计下载目录里所有 csv 的行数，写个脚�
 
 ## 持续集成
 
-`.github/workflows/ci.yml` 在每次 push / PR 时跑 14 组断言（语法、MCP 协议、
+`.github/workflows/ci.yml` 在每次 push / PR 时跑 15 组断言 + Android 工程静态检查（语法、MCP 协议、
 终端状态与超时、60 次压测、调试顾问、架构卡片、主动介入、安全隔离、setup.sh）。
 
 本地先自检再 push，断言与 CI 完全一致：
@@ -438,6 +477,8 @@ function calling），ds-agent 用原生 tool_calls，**解析代码为 0 行**�
 | `intervene.py` | 主动介入：卡住暂停、诊断报告、人工接管（支持外部决策通道） |
 | `webui.py` | Web UI：SSE 流式输出 + 手机端决策（服务器跑，手机访问） |
 | `hardening.py` | 本地模式加固：rlimit + 命令闸门 + 写操作审批 |
+| `inprocess.py` | 进程内执行器：无独立解释器时的降级（指令预算拦死循环） |
+| `android_shim.py` | Android 适配：工作目录、skills 落盘、能力探测 |
 | `arch_cards.py` | 架构知识按需注入（工程坑位取向，非架构科普） |
 | `selftest.py` | 本地自检（与 CI 同断言，push 前跑一遍） |
 | `COMPARE.md` | 与 dsmod 终端实现的逐项对比与实测数据 |

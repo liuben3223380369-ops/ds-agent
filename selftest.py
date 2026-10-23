@@ -12,6 +12,7 @@ import sys
 import json
 import time
 import shutil
+from pathlib import Path
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -435,6 +436,77 @@ def t_webui():
         encoding="utf-8").read(), "未见 TOKEN 替换逻辑"
 
 
+def t_android():
+    """Android 降级路径：进程内执行 + 无解释器时的 MCP 跳过 + shim 初始化。"""
+    import tempfile
+    from inprocess import (InProcessRunner, can_subprocess_python,
+                           can_subprocess_sh, detect)
+
+    # 进程内执行器
+    r = InProcessRunner()
+    out = r.run("print(sum(range(10)))")
+    assert "45" in out and "[exit=0]" in out, f"正常执行异常: {out}"
+
+    res = r.run("1/0")
+    assert "[exit=1]" in res and "ZeroDivisionError" in res, f"异常未捕获: {res}"
+
+    # 死循环必须被指令预算拦住（墙钟超时在同进程内做不到）
+    import time
+    t0 = time.time()
+    res2 = r.run("while True:\n    pass\n", timeout=2)
+    assert "[exit=124]" in res2, f"死循环未被拦: {res2}"
+    assert time.time() - t0 < 30, "拦截耗时过长"
+
+    # exit() 不能带走宿主进程
+    res3 = r.run("exit()")
+    assert "[exit=0]" in res3 or "RuntimeError" in res3 or "已禁用" in res3, \
+        f"exit() 未被处理: {res3}"
+    res4 = r.run("import sys; sys.exit(0)")
+    assert "[exit=0]" in res4, f"SystemExit 未拦: {res4}"
+
+    # 能力探测能跑通
+    info = detect()
+    assert isinstance(info.get("python_subprocess"), bool)
+    assert isinstance(info.get("sh_subprocess"), bool)
+
+    # shim：必须在 import ds_agent_pro 前就能定好工作目录
+    import android_shim
+    d = tempfile.mkdtemp()
+    wd = android_shim.init(d)
+    import os
+    assert os.path.isabs(wd) and wd.startswith(d), f"工作目录不对: {wd}"
+    assert (Path(d) / "skills").is_dir(), "skills 未落盘"
+    assert (Path(d) / "skills" / "tdd.md").exists(), "内置 skill 缺失"
+    assert (Path(d) / "mcp.json").exists(), "mcp.json 未生成"
+    assert android_shim.report(), "环境报告为空"
+
+    # 模拟无独立解释器：Sandbox 应切到进程内
+    import ds_agent_pro as A
+    saved = A.can_subprocess_python
+    A.can_subprocess_python = lambda: False
+    try:
+        sb = A.Sandbox(A.ROOT, "local", [])
+        assert sb.inproc is not None, "未切到进程内执行器"
+        out2 = sb.run_python("print('ok')")
+        assert "进程内执行" in out2 and "ok" in out2, f"降级未生效: {out2}"
+        sb.close()
+    finally:
+        A.can_subprocess_python = saved
+
+    # 无解释器时 stdio MCP 应被跳过（而不是白 spawn 一次）
+    import json
+    cfgp = os.path.join(tempfile.mkdtemp(), "mcp.json")
+    json.dump({"mcpServers": {"demo": {"command": "python3",
+                                       "args": ["mcp_demo_server.py"]}}},
+              open(cfgp, "w"))
+    A.can_subprocess_python = lambda: False
+    try:
+        hub = A.MCPHub(cfgp)
+        assert hub.start() == [], "无解释器时 stdio MCP 应被跳过"
+    finally:
+        A.can_subprocess_python = saved
+
+
 def t_setup():
     import subprocess
     here = os.path.dirname(os.path.abspath(__file__))
@@ -457,6 +529,7 @@ if __name__ == "__main__":
     check("主动介入（触发/决策/注入）", t_intervene)
     check("本地模式加固（命令/审批/限额）", t_hardening)
     check("Web UI（鉴权/介入通道）", t_webui)
+    check("Android 降级（进程内执行/shim）", t_android)
     check("路径与命令安全", t_safe)
     check("setup.sh 语法", t_setup)
     print(f"\n通过 {len(PASS)} / {len(PASS)+len(FAIL)}")

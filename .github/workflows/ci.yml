@@ -428,6 +428,83 @@ jobs:
           print("✅ Web UI：介入通道 / 应答链路 / 页面 通过")
           EOF
 
+      - name: Android fallback (in-process exec + shim)
+        run: |
+          python - <<'EOF'
+          import sys, os, json, time, tempfile
+          sys.path.insert(0, '.')
+          from pathlib import Path
+          from inprocess import InProcessRunner, detect
+
+          r = InProcessRunner()
+          out = r.run("print(sum(range(10)))")
+          assert "45" in out and "[exit=0]" in out, f"正常执行异常: {out}"
+          res = r.run("1/0")
+          assert "[exit=1]" in res and "ZeroDivisionError" in res
+          t0 = time.time()
+          res2 = r.run("while True:\n    pass\n", timeout=2)
+          assert "[exit=124]" in res2, "死循环未被指令预算拦住"
+          assert time.time() - t0 < 30, "拦截耗时过长"
+          res3 = r.run("import sys; sys.exit(0)")
+          assert "[exit=0]" in res3, "SystemExit 未拦住"
+
+          import android_shim
+          d = tempfile.mkdtemp()
+          wd = android_shim.init(d)
+          assert os.path.isabs(wd) and wd.startswith(d)
+          assert (Path(d) / "skills" / "tdd.md").exists(), "内置 skill 未落盘"
+          assert (Path(d) / "mcp.json").exists()
+          assert android_shim.report()
+
+          import ds_agent_pro as A
+          saved = A.can_subprocess_python
+          A.can_subprocess_python = lambda: False
+          try:
+              sb = A.Sandbox(A.ROOT, "local", [])
+              assert sb.inproc is not None, "未切到进程内执行器"
+              o = sb.run_python("print('ok')")
+              assert "进程内执行" in o and "ok" in o
+              sb.close()
+              cfgp = os.path.join(tempfile.mkdtemp(), "mcp.json")
+              json.dump({"mcpServers": {"demo": {"command": "python3",
+                                                 "args": ["x.py"]}}}, open(cfgp, "w"))
+              assert A.MCPHub(cfgp).start() == [], "无解释器时 stdio MCP 应被跳过"
+          finally:
+              A.can_subprocess_python = saved
+          print("✅ Android 降级：进程内执行 / shim / MCP 跳过 通过")
+          EOF
+
+      - name: Android project static check
+        run: |
+          python - <<'EOF'
+          import glob, xml.etree.ElementTree as ET
+          base = "android"
+          # XML 必须全部合法
+          n = 0
+          for f in glob.glob(f"{base}/**/*.xml", recursive=True):
+              ET.parse(f); n += 1
+          assert n >= 6, f"XML 太少: {n}"
+
+          # Kotlin / Gradle 括号配平（没有 kotlinc，只能做这层）
+          for f in glob.glob(f"{base}/**/*.kt", recursive=True) + \
+                   glob.glob(f"{base}/**/*.kts", recursive=True):
+              s = open(f, encoding="utf-8").read()
+              for a, b in ("{}", "()", "[]"):
+                  assert s.count(a) == s.count(b), f"{f}: {a}{b} 不配平"
+
+          # 关键配置必须存在
+          app = open(f"{base}/app/build.gradle.kts", encoding="utf-8").read()
+          assert 'id("com.chaquo.python")', "缺少 Chaquopy 插件"
+          assert 'version = "3.13"', "必须是 Python 3.13+（Android 15 的 16KB 对齐要求）"
+          assert 'abiFilters' in app and "arm64-v8a" in app
+          assert 'python.srcDirs' in app, "未把主项目 Python 纳入打包"
+
+          man = open(f"{base}/app/src/main/AndroidManifest.xml", encoding="utf-8").read()
+          assert "FOREGROUND_SERVICE" in man, "缺少前台服务权限（后台会被系统回收）"
+          assert "INTERNET" in man
+          print(f"✅ Android 工程静态检查通过（{n} 个 XML + Kotlin/Gradle 配平）")
+          EOF
+
       - name: Path sandbox & shell safety
         run: |
           python - <<'EOF'
