@@ -42,7 +42,8 @@ CHOICES = {
 
 class Intervention:
     def __init__(self, root, snap=None, sandbox=None, advisor=None,
-                 stall=3, same=4, budget=240, enabled=True):
+                 stall=3, same=4, budget=240, enabled=True,
+                 asker=None, wait_timeout=600):
         self.root = Path(root).resolve()
         self.snap = snap
         self.sandbox = sandbox
@@ -51,6 +52,12 @@ class Intervention:
         self.same_limit = same
         self.time_limit = budget
         self.enabled = enabled
+
+        # asker: 可选的外部决策通道（Web UI 用）。
+        #   签名 asker(question_dict) -> (decision, data) 或 None（超时/无人应答）
+        #   为 None 时走原来的终端 input()
+        self.asker = asker
+        self.wait_timeout = wait_timeout
 
         self.t0 = time.time()
         self.fail_streak = 0       # 连续失败轮数
@@ -188,17 +195,44 @@ class Intervention:
         if path:
             print(f"   完整报告：{path}")
 
+        # 外部决策通道（Web UI）：优先于终端交互
+        if self.asker is not None:
+            q = {
+                "task": task,
+                "reason": reason,
+                "summary": self.advisor.summary() if self.advisor else "",
+                "report": report,
+                "report_path": str(path) if path else "",
+                "round": self.round_no,
+                "choices": [
+                    {"key": "1", "value": CONTINUE, "label": "继续",
+                     "desc": "让模型再试"},
+                    {"key": "2", "value": ROLLBACK, "label": "回滚重来",
+                     "desc": "回到上一个能跑的版本", "needs_steps": True},
+                    {"key": "3", "value": MANUAL, "label": "手动接管",
+                     "desc": "你自己进 shell 修，exit 后回来"},
+                    {"key": "4", "value": HINT, "label": "给提示",
+                     "desc": "写一句方向性提示再继续", "needs_text": True},
+                    {"key": "5", "value": ABORT, "label": "放弃",
+                     "desc": "停在这里保留现场"},
+                ],
+            }
+            try:
+                ans = self.asker(q)
+            except Exception as e:
+                print(f"   [外部决策通道异常] {type(e).__name__}: {e}")
+                ans = None
+            if ans is not None:
+                dec, data = ans
+                print(f"   外部决策：{dec}" + (f"（{data}）" if data else ""))
+                return dec, data
+            # 无人应答 → 落到下面的非交互策略
+
         # 非交互：按环境变量决定
         if not self._interactive():
             policy = os.environ.get("DS_ON_STUCK", "continue").lower()
             print(f"   非交互环境，按 DS_ON_STUCK={policy} 处理")
-            if policy == "abort":
-                return ABORT, None
-            if policy == "rollback":
-                return ROLLBACK, 1
-            if policy == "hint":
-                return HINT, os.environ.get("DS_HINT", "请换一条实现思路")
-            return CONTINUE, None
+            return self._policy(policy)
 
         print("\n  1) 继续      让模型再试")
         print("  2) 回滚重来  回到上一个能跑的版本")
@@ -231,6 +265,17 @@ class Intervention:
             if raw.lower() in ("1", "c", "continue"):
                 return CONTINUE, None
             print("  未识别，请输入 1-5")
+
+    @staticmethod
+    def _policy(policy):
+        """非交互 / 无人应答时的兜底策略。"""
+        if policy == "abort":
+            return ABORT, None
+        if policy == "rollback":
+            return ROLLBACK, 1
+        if policy == "hint":
+            return HINT, os.environ.get("DS_HINT", "请换一条实现思路")
+        return CONTINUE, None
 
     def _ask_steps(self):
         while True:

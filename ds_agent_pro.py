@@ -40,13 +40,17 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ImportError:                      # 延迟到真正调用时才报错，--serve 不受影响
+    OpenAI = None
 
 from mcp_client import MCPClient, load_servers, make_client
 from terminal import Terminal
 from debug_advisor import DebugAdvisor, needs_test, test_nudge
 from arch_cards import build_arch_prompt, skeleton_for
 from intervene import (Intervention, CONTINUE, ROLLBACK, MANUAL, HINT, ABORT)
+from hardening import build_limits, preexec, scan_command, Gate, describe as describe_hard
 from skills import SkillBook, ensure_builtin
 from streaming import (StreamRenderer, iter_stream, FenceScanner,
                        IdleGate, ToolCallAccumulator)
@@ -125,8 +129,12 @@ class Sandbox:
         if mode == "auto":
             self.mode = "docker" if self._docker_ok() else "local"
         # 持久终端会话：cwd / 环境变量跨调用保留（改进 dsmod 每次新进程的做法）
+        self.limits = build_limits() if self.mode == "local" else {}
         self.term = Terminal(root, self.mode, mounts=self.mounts, image=IMAGE,
-                             network=NETWORK, memory=MEMORY, cpus=CPUS)
+                             network=NETWORK, memory=MEMORY, cpus=CPUS,
+                             limits=self.limits)
+        self.gate = Gate(approver=(lambda c, w: WEB_APPROVER(c, w)) if WEB_APPROVER else None,
+                         enabled=(self.mode == "local"))
         self.mode = self.term.mode          # docker 启动失败会被 Terminal 降级
         self.note = self.term.note
         if self.mounts:
@@ -203,7 +211,9 @@ class Sandbox:
             if self.mode == "docker":
                 return self._docker_run(["python", "-u", f"/w/{rel}"], timeout)
             p = subprocess.run([sys.executable, "-u", str(fp)], cwd=cwd,
-                               capture_output=True, text=True, timeout=timeout)
+                               capture_output=True, text=True, timeout=timeout,
+                               preexec_fn=preexec(self.limits)
+                               if self.limits else None)
             parts = [f"[环境] 本机 Python {sys.version.split()[0]} · cwd={cwd}"]
             if p.stdout.strip():
                 parts.append(clip(p.stdout.rstrip()))
@@ -224,6 +234,11 @@ class Sandbox:
         for b in BLOCK:
             if b in low:
                 return f"[已拦截] 危险命令: {b}"
+        # 本地模式加固：危险命令拦截 + 写操作审批（Docker 模式下 gate 关闭）
+        if self.gate.enabled:
+            ok, why = self.gate.check(cmd)
+            if not ok:
+                return f"[已拦截] {why}"
         return self.term.run(cmd, timeout)      # 走持久会话
 
     @property
@@ -286,6 +301,11 @@ class Snapshot:
             return f"回退失败: {out}"
         _, cur = sh("git rev-parse HEAD")
         return f"✅ 已回退 {steps} 步 → {cur.strip()[:8]}（原状态已存为保险点，可用 git reflog 找回）"
+
+
+# Web UI 注入的钩子：接入后介入与审批走浏览器，而不是终端 input()
+WEB_ASKER = None        # asker(question) -> (decision, data) | None
+WEB_APPROVER = None     # approver(cmd, why) -> bool | None
 
 
 def _safe_name(s: str) -> str:
@@ -482,8 +502,11 @@ def build_system(sandbox, task=""):
 
 
 def run(task, sandbox, snap, hub, tools, dispatch, client=None):
-    client = client or OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"],
-                              base_url="https://api.deepseek.com")
+    if client is None:
+        if OpenAI is None:
+            raise RuntimeError("未安装 openai SDK：pip install openai")
+        client = OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"],
+                        base_url="https://api.deepseek.com")
     messages = [{"role": "system", "content": build_system(sandbox, task)},
                 {"role": "user", "content": task}]
     seen = set()
@@ -687,6 +710,14 @@ def main():
     args = sys.argv[1:]
     ROOT.mkdir(parents=True, exist_ok=True)
     snap = Snapshot(ROOT, SNAPSHOT_ON)
+
+    # Web UI：服务器跑 Agent，手机浏览器访问（保留完整 Docker 隔离）
+    if "--serve" in args:
+        i = args.index("--serve")
+        port = int(args[i + 1]) if i + 1 < len(args) and args[i + 1].isdigit() else 8080
+        from webui import serve
+        serve(port=port)
+        return
 
     if "--snapshots" in args:
         print(snap.list()); return

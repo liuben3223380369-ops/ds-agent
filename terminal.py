@@ -31,6 +31,27 @@ import subprocess
 from pathlib import Path
 
 
+def _preexec(limits):
+    """在 fork 出的子进程里施加 rlimit。只能降不能升。"""
+    import resource
+    RL = {"cpu": resource.RLIMIT_CPU, "as": resource.RLIMIT_AS,
+          "nofile": resource.RLIMIT_NOFILE, "nproc": resource.RLIMIT_NPROC,
+          "fsize": resource.RLIMIT_FSIZE}
+
+    def _fn():
+        for k, v in (limits or {}).items():
+            if k not in RL:
+                continue
+            try:
+                soft, hard = resource.getrlimit(RL[k])
+                new = min(v, hard) if hard != resource.RLIM_INFINITY else v
+                resource.setrlimit(RL[k], (new, hard))
+            except (ValueError, OSError):
+                pass
+
+    return _fn
+
+
 class Terminal:
     """跨调用保留 cwd 与环境变量的 shell 会话。"""
 
@@ -38,7 +59,7 @@ class Terminal:
     MAX_ERR = 20000
 
     def __init__(self, root, mode="auto", mounts=None, image="python:3.12-slim",
-                 network="none", memory="512m", cpus="1"):
+                 network="none", memory="512m", cpus="1", limits=None):
         self.root = Path(root).resolve()
         self.mounts = mounts or []
         self.image, self.network = image, network
@@ -54,6 +75,7 @@ class Terminal:
         self.env_path = "/w/.dsenv" if self.mode == "docker" else str(self.env_file)
         self._lock = threading.Lock()              # 防重入（对应 dsmod 的 PENDING）
         self.note = ""
+        self.limits = limits or {}                 # 本地模式资源上限（Docker 不需要）
         self._spawn()
 
     # ---------------- 会话生命周期 ----------------
@@ -87,10 +109,15 @@ class Terminal:
         if self.mode == "local":
             if not self.note:
                 self.note = "[沙箱] ⚠️ 未检测到可用 Docker，已回退本地执行（无隔离）"
+            # rlimit 施加在常驻 shell 上，它 fork 出的所有命令都会继承。
+            # 这是本地模式下唯一绕不过去的一层（命令黑名单可以被拼接绕过）。
+            kw = {}
+            if getattr(self, "limits", None):
+                kw["preexec_fn"] = _preexec(self.limits)
             self.proc = subprocess.Popen(
                 ["sh"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, cwd=str(self.root), text=True,
-                bufsize=1, start_new_session=True,
+                bufsize=1, start_new_session=True, **kw
             )
         self._restore()
 
