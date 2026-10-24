@@ -61,9 +61,25 @@ echo "  openai SDK 就绪"
 
 # ---------- 4. 手机存储授权 ----------
 echo "[4/5] 环境检查"
-if [ -d /data/data/com.termux ] && [ ! -d /sdcard ]; then
-    echo "  ⚠️ 检测到 Termux 但 /sdcard 不可见"
-    echo "     请执行： termux-setup-storage   然后重新运行本脚本"
+# Termux 检测：不要硬编码 com.termux —— 官方版、Google Play 版、
+# 第三方克隆版的包名都不一样（见过 com.termux / com.localt 等）。
+# $PREFIX 是 Termux 系环境共有的特征（指向 /data/data/<pkg>/files/usr）。
+IS_TERMUX=no
+case "${PREFIX:-}" in
+    /data/data/*) IS_TERMUX=yes ;;
+esac
+[ -d /sdcard ] && [ ! -w /sdcard ] && IS_TERMUX=yes
+command -v termux-setup-storage >/dev/null 2>&1 && IS_TERMUX=yes
+
+if [ "$IS_TERMUX" = yes ]; then
+    echo "  检测到 Termux 系环境（PREFIX=${PREFIX:-未设置}）"
+    if [ ! -d /sdcard ] || [ ! -r /sdcard ]; then
+        echo "  ⚠️ /sdcard 不可见或不可读"
+        echo "     请执行： termux-setup-storage   然后重新运行本脚本"
+    else
+        echo "  存储已可访问：/sdcard"
+    fi
+    echo "  ⚠️ 无 Docker，将回退本地执行（建议 DS_FS_READONLY=1）"
 fi
 
 # ---------- 5. 生成配置 ----------
@@ -115,6 +131,7 @@ echo "  4) 常用维护"
 echo "     python3 ds_agent_pro.py --snapshots      # 看快照"
 echo "     python3 ds_agent_pro.py --rollback 3     # 回退 3 步"
 echo
-if [ -d /data/data/com.termux ]; then
+if [ "$IS_TERMUX" = yes ]; then
     echo "手机提示：Termux 无 Docker，会回退本地执行，建议开 DS_FS_READONLY=1"
+    echo "         外链目录示例： DS_FS_ROOTS=/sdcard/Download DS_FS_READONLY=1"
 fi
